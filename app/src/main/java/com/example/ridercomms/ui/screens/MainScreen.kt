@@ -1,11 +1,16 @@
 package com.example.ridercomms.ui.screens
 
+import android.Manifest
+import android.content.pm.PackageManager
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -17,7 +22,6 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -34,6 +38,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
@@ -45,19 +50,44 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
+import com.example.ridercomms.R
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MainScreen() {
+    val context = LocalContext.current
     var selectedTabIndex by remember { mutableIntStateOf(0) } // 0 = Join Group, 1 = Host Group
     var isConnected by remember { mutableStateOf(false) }
     var isMicMuted by remember { mutableStateOf(true) }
     var hostIpAddress by remember { mutableStateOf("192.168.43.1") }
     var volume by remember { mutableFloatStateOf(0.8f) }
+    var hasMicPermission by remember {
+        mutableStateOf(
+            ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.RECORD_AUDIO
+            ) == PackageManager.PERMISSION_GRANTED
+        )
+    }
+
+    // Permission Launcher for Microphone access
+    val permissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission(),
+        onResult = { isGranted -> hasMicPermission = isGranted }
+    )
+
+    LaunchedEffect(Unit) {
+        if (!hasMicPermission) {
+            permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+        }
+    }
 
     val infiniteTransition = rememberInfiniteTransition(label = "pulse_transition")
     val animatedAlpha by infiniteTransition.animateFloat(
@@ -78,7 +108,18 @@ fun MainScreen() {
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("RiderComms Intercom", fontWeight = FontWeight.Bold) },
+                title = {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Image(
+                            painter = painterResource(id = R.drawable.ic_ridercomms_logo),
+                            contentDescription = "RiderComms Logo",
+                            modifier = Modifier
+                                .size(36.dp)
+                                .padding(end = 8.dp)
+                        )
+                        Text("RiderComms Intercom", fontWeight = FontWeight.Bold)
+                    }
+                },
                 colors = TopAppBarDefaults.topAppBarColors(
                     containerColor = MaterialTheme.colorScheme.primaryContainer,
                     titleContentColor = MaterialTheme.colorScheme.onPrimaryContainer
@@ -108,7 +149,7 @@ fun MainScreen() {
                 )
             }
 
-            Spacer(modifier = Modifier.height(12.dp))
+            Spacer(modifier = Modifier.height(8.dp))
 
             // Status Card
             Card(
@@ -131,9 +172,9 @@ fun MainScreen() {
                         )
                         Text(
                             text = if (isConnected) {
-                                if (selectedTabIndex == 1) "Hosting at $hostIpAddress" else "Connected to $hostIpAddress"
+                                if (selectedTabIndex == 1) "Hosting Server on local port 50005" else "Target IP: $hostIpAddress"
                             } else {
-                                if (selectedTabIndex == 1) "Hotspot active, start server" else "Connect to host Hotspot"
+                                if (selectedTabIndex == 1) "Turn on Hotspot then tap Start" else "Connect Wi-Fi to Host Hotspot"
                             },
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -150,26 +191,44 @@ fun MainScreen() {
                 }
             }
 
-            // Mic Toggle
+            // Central Mic Button
             Column(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.Center
             ) {
                 Button(
-                    onClick = { if (isConnected) isMicMuted = !isMicMuted },
-                    enabled = isConnected,
+                    onClick = {
+                        if (!hasMicPermission) {
+                            permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                        } else if (isConnected) {
+                            isMicMuted = !isMicMuted
+                        }
+                    },
+                    enabled = isConnected || !hasMicPermission,
                     modifier = Modifier.size(120.dp),
                     shape = CircleShape,
                     colors = ButtonDefaults.buttonColors(
-                        containerColor = if (!isMicMuted && isConnected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.errorContainer
+                        containerColor = when {
+                            !hasMicPermission -> MaterialTheme.colorScheme.error
+                            !isMicMuted && isConnected -> MaterialTheme.colorScheme.primary
+                            else -> MaterialTheme.colorScheme.errorContainer
+                        }
                     )
                 ) {
                     Text(
-                        text = if (!isMicMuted && isConnected) "MIC\nLIVE" else "MIC\nMUTED",
-                        fontSize = 18.sp,
+                        text = when {
+                            !hasMicPermission -> "GRANT\nMIC"
+                            !isMicMuted && isConnected -> "MIC\nLIVE"
+                            else -> "MIC\nMUTED"
+                        },
+                        fontSize = 16.sp,
                         fontWeight = FontWeight.Bold,
                         textAlign = TextAlign.Center,
-                        color = if (!isMicMuted && isConnected) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onErrorContainer
+                        color = if (!isMicMuted && isConnected && hasMicPermission) {
+                            MaterialTheme.colorScheme.onPrimary
+                        } else {
+                            MaterialTheme.colorScheme.onErrorContainer
+                        }
                     )
                 }
 
@@ -177,9 +236,10 @@ fun MainScreen() {
 
                 Text(
                     text = when {
-                        !isConnected -> "Connect to enable Mic"
+                        !hasMicPermission -> "Microphone Permission Required"
+                        !isConnected -> "Connect session to activate voice"
                         isMicMuted -> "Microphone Muted"
-                        else -> "Transmitting Audio..."
+                        else -> "Transmitting Audio Streams..."
                     },
                     fontWeight = FontWeight.SemiBold,
                     fontSize = 14.sp,
@@ -187,35 +247,26 @@ fun MainScreen() {
                 )
             }
 
-            // Connection Parameters & Controls
+            // Input Fields & Action Buttons
             Column(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
                 if (selectedTabIndex == 0 && !isConnected) {
-                    // Client View: Enter Host IP
                     OutlinedTextField(
                         value = hostIpAddress,
                         onValueChange = { hostIpAddress = it },
-                        label = { Text("Host IP Address") },
+                        label = { Text("Host Gateway IP Address") },
+                        supportingText = { Text("Default Android Hotspot IPs: 192.168.43.1 or 192.168.50.1") },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth()
                     )
                     Spacer(modifier = Modifier.height(8.dp))
-                } else if (selectedTabIndex == 1 && !isConnected) {
-                    // Host View Info
-                    Text(
-                        text = "Your Hotspot IP: $hostIpAddress",
-                        style = MaterialTheme.typography.bodyMedium,
-                        fontWeight = FontWeight.Medium,
-                        modifier = Modifier.padding(bottom = 8.dp)
-                    )
                 }
 
-                // Volume Controls
                 Column(modifier = Modifier.fillMaxWidth()) {
                     Text(
-                        text = "Earphone Volume: ${(volume * 100).toInt()}%",
+                        text = "Earpiece Volume: ${(volume * 100).toInt()}%",
                         style = MaterialTheme.typography.bodySmall
                     )
                     Slider(
@@ -228,11 +279,14 @@ fun MainScreen() {
 
                 Spacer(modifier = Modifier.height(8.dp))
 
-                // Connect / Disconnect Action Button
                 Button(
                     onClick = {
-                        isConnected = !isConnected
-                        if (isConnected) isMicMuted = false
+                        if (!hasMicPermission) {
+                            permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                        } else {
+                            isConnected = !isConnected
+                            if (isConnected) isMicMuted = false
+                        }
                     },
                     modifier = Modifier
                         .fillMaxWidth()
@@ -243,7 +297,7 @@ fun MainScreen() {
                 ) {
                     Text(
                         text = when {
-                            isConnected -> "Disconnect"
+                            isConnected -> "Disconnect Intercom"
                             selectedTabIndex == 1 -> "Start Hosting Server"
                             else -> "Connect to Host"
                         },
