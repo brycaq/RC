@@ -23,8 +23,6 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -41,13 +39,14 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -62,29 +61,35 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import com.example.ridercomms.R
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
-
-data class PeerRider(
-    val id: String,
-    val name: String,
-    val ipAddress: String,
-    val isSpeaking: Boolean = false
-)
+import com.example.ridercomms.network.AudioStreamManager
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MainScreen() {
     val context = LocalContext.current
-    val coroutineScope = rememberCoroutineScope()
 
     var selectedTabIndex by remember { mutableIntStateOf(0) } // 0 = Join Group, 1 = Host Group
     var isConnected by remember { mutableStateOf(false) }
-    var isConnecting by remember { mutableStateOf(false) }
     var isMicMuted by remember { mutableStateOf(true) }
     var hostIpAddress by remember { mutableStateOf("192.168.43.1") }
     var volume by remember { mutableFloatStateOf(0.8f) }
-    var connectedPeers by remember { mutableStateOf(listOf<PeerRider>()) }
+    val connectedPeers = remember { mutableStateListOf<String>() }
+
+    val audioManager = remember {
+        AudioStreamManager(
+            onPeerDiscovered = { ip ->
+                if (!connectedPeers.contains(ip)) {
+                    connectedPeers.add(ip)
+                }
+            }
+        )
+    }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            audioManager.stop()
+        }
+    }
 
     var hasMicPermission by remember {
         mutableStateOf(
@@ -119,10 +124,9 @@ fun MainScreen() {
 
     val statusColor by animateColorAsState(
         targetValue = when {
-            isConnected && connectedPeers.isNotEmpty() -> Color(0xFF4CAF50) // Green: Connected to peer
-            isConnected -> Color(0xFFFF9800) // Orange: Hosting / Waiting for peer
-            isConnecting -> Color(0xFF2196F3) // Blue: Handshaking
-            else -> Color(0xFFE53935) // Red: Disconnected
+            isConnected && connectedPeers.isNotEmpty() -> Color(0xFF4CAF50) // Green: Active peer
+            isConnected -> Color(0xFFFF9800) // Orange: Server Active / Waiting
+            else -> Color(0xFFE53935) // Red: Off
         },
         label = "status_color"
     )
@@ -157,23 +161,23 @@ fun MainScreen() {
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.SpaceBetween
         ) {
-            // Mode Selector: Join vs Host
+            // Tab Selector
             TabRow(selectedTabIndex = selectedTabIndex) {
                 Tab(
                     selected = selectedTabIndex == 0,
-                    onClick = { if (!isConnected && !isConnecting) selectedTabIndex = 0 },
+                    onClick = { if (!isConnected) selectedTabIndex = 0 },
                     text = { Text("Join Group") }
                 )
                 Tab(
                     selected = selectedTabIndex == 1,
-                    onClick = { if (!isConnected && !isConnecting) selectedTabIndex = 1 },
+                    onClick = { if (!isConnected) selectedTabIndex = 1 },
                     text = { Text("Host Group") }
                 )
             }
 
             Spacer(modifier = Modifier.height(8.dp))
 
-            // Enhanced Connection Status & Peer Confirmation Card
+            // Connection Status & Peer Card
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
@@ -187,9 +191,8 @@ fun MainScreen() {
                         Column {
                             Text(
                                 text = when {
-                                    isConnecting -> "CONNECTING..."
-                                    isConnected && connectedPeers.isNotEmpty() -> "PEER CONNECTED"
-                                    isConnected -> "HOSTING (WAITING FOR PEERS)"
+                                    isConnected && connectedPeers.isNotEmpty() -> "REAL-TIME LINK LIVE"
+                                    isConnected -> "LISTENING ON UDP 50005"
                                     else -> "DISCONNECTED"
                                 },
                                 fontWeight = FontWeight.Bold,
@@ -198,9 +201,8 @@ fun MainScreen() {
                             )
                             Text(
                                 text = when {
-                                    isConnecting -> "Exchanging handshake with $hostIpAddress..."
-                                    isConnected && connectedPeers.isNotEmpty() -> "${connectedPeers.size} Rider(s) Active in Channel"
-                                    isConnected -> "Server Active on Port 50005"
+                                    isConnected && connectedPeers.isNotEmpty() -> "${connectedPeers.size} Active Voice Stream(s)"
+                                    isConnected -> if (selectedTabIndex == 1) "Waiting for incoming voice packets..." else "Sending UDP packets to $hostIpAddress"
                                     else -> "Join or Host a local audio channel"
                                 },
                                 style = MaterialTheme.typography.bodyMedium,
@@ -213,53 +215,43 @@ fun MainScreen() {
                                 .size(14.dp)
                                 .clip(CircleShape)
                                 .background(statusColor)
-                                .then(if (isConnected || isConnecting) Modifier.alpha(animatedAlpha) else Modifier)
+                                .then(if (isConnected) Modifier.alpha(animatedAlpha) else Modifier)
                         )
                     }
 
-                    // Connected Peers List Section
                     if (isConnected) {
                         Spacer(modifier = Modifier.height(12.dp))
                         Text(
-                            text = "Connected Peers:",
+                            text = "Detected Network Peers:",
                             style = MaterialTheme.typography.labelMedium,
                             fontWeight = FontWeight.Bold
                         )
                         Spacer(modifier = Modifier.height(4.dp))
                         if (connectedPeers.isEmpty()) {
                             Text(
-                                text = "No riders connected yet. Ensure other rider enters IP: $hostIpAddress",
+                                text = "No audio received yet. Ensure client IP matches Gateway ($hostIpAddress).",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.outline
                             )
                         } else {
-                            connectedPeers.forEach { peer ->
+                            connectedPeers.forEach { peerIp ->
                                 Row(
                                     modifier = Modifier
                                         .fillMaxWidth()
-                                        .padding(vertical = 4.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.SpaceBetween
+                                        .padding(vertical = 2.dp),
+                                    verticalAlignment = Alignment.CenterVertically
                                 ) {
-                                    Row(verticalAlignment = Alignment.CenterVertically) {
-                                        Box(
-                                            modifier = Modifier
-                                                .size(8.dp)
-                                                .clip(CircleShape)
-                                                .background(Color(0xFF4CAF50))
-                                        )
-                                        Spacer(modifier = Modifier.width(8.dp))
-                                        Text(
-                                            text = "${peer.name} (${peer.ipAddress})",
-                                            style = MaterialTheme.typography.bodyMedium,
-                                            fontWeight = FontWeight.Medium
-                                        )
-                                    }
+                                    Box(
+                                        modifier = Modifier
+                                            .size(8.dp)
+                                            .clip(CircleShape)
+                                            .background(Color(0xFF4CAF50))
+                                    )
+                                    Spacer(modifier = Modifier.width(8.dp))
                                     Text(
-                                        text = if (peer.isSpeaking) "AUDIO LIVE" else "IDLE",
-                                        fontSize = 11.sp,
-                                        fontWeight = FontWeight.Bold,
-                                        color = if (peer.isSpeaking) Color(0xFF4CAF50) else Color.Gray
+                                        text = "Peer at $peerIp",
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        fontWeight = FontWeight.Medium
                                     )
                                 }
                             }
@@ -268,7 +260,7 @@ fun MainScreen() {
                 }
             }
 
-            // Central Mic Button
+            // Mic Toggle
             Column(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.Center
@@ -279,6 +271,7 @@ fun MainScreen() {
                             permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
                         } else if (isConnected) {
                             isMicMuted = !isMicMuted
+                            audioManager.setMuted(isMicMuted)
                         }
                     },
                     enabled = isConnected || !hasMicPermission,
@@ -316,7 +309,7 @@ fun MainScreen() {
                         !hasMicPermission -> "Microphone Permission Required"
                         !isConnected -> "Connect session to activate voice"
                         isMicMuted -> "Microphone Muted"
-                        else -> "Transmitting Audio Streams..."
+                        else -> "Streaming Microphone Data..."
                     },
                     fontWeight = FontWeight.SemiBold,
                     fontSize = 13.sp,
@@ -324,7 +317,7 @@ fun MainScreen() {
                 )
             }
 
-            // Controls & Connection Triggers
+            // Connection Inputs & Buttons
             Column(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalAlignment = Alignment.CenterHorizontally
@@ -332,9 +325,12 @@ fun MainScreen() {
                 if (selectedTabIndex == 0 && !isConnected) {
                     OutlinedTextField(
                         value = hostIpAddress,
-                        onValueChange = { hostIpAddress = it },
+                        onValueChange = {
+                            hostIpAddress = it
+                            audioManager.setTargetIp(it)
+                        },
                         label = { Text("Host Gateway IP Address") },
-                        supportingText = { Text("Common Hotspot IPs: 192.168.43.1 or 192.168.50.1") },
+                        supportingText = { Text("Enter Hotspot IP (e.g. 192.168.43.1 or 192.168.50.1)") },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth()
                     )
@@ -361,44 +357,20 @@ fun MainScreen() {
                         if (!hasMicPermission) {
                             permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
                         } else if (isConnected) {
-                            // Disconnect
+                            // Stop UDP Audio Socket
+                            audioManager.stop()
                             isConnected = false
-                            isConnecting = false
-                            connectedPeers = emptyList()
+                            connectedPeers.clear()
                             isMicMuted = true
                         } else {
-                            // Start Connection / Hosting Handshake
-                            coroutineScope.launch {
-                                isConnecting = true
-                                delay(1200) // Simulate network handshake verification
-                                isConnecting = false
-                                isConnected = true
-                                isMicMuted = false
-
-                                // Confirm active peer connection feedback
-                                connectedPeers = if (selectedTabIndex == 1) {
-                                    listOf(
-                                        PeerRider(
-                                            id = "peer_1",
-                                            name = "Rider 2",
-                                            ipAddress = "192.168.43.15",
-                                            isSpeaking = true
-                                        )
-                                    )
-                                } else {
-                                    listOf(
-                                        PeerRider(
-                                            id = "host_1",
-                                            name = "Host Rider",
-                                            ipAddress = hostIpAddress,
-                                            isSpeaking = false
-                                        )
-                                    )
-                                }
-                            }
+                            // Start UDP Audio Socket
+                            val target = if (selectedTabIndex == 0) hostIpAddress else null
+                            audioManager.start(target)
+                            isConnected = true
+                            isMicMuted = false
+                            audioManager.setMuted(false)
                         }
                     },
-                    enabled = !isConnecting,
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(50.dp),
@@ -408,10 +380,9 @@ fun MainScreen() {
                 ) {
                     Text(
                         text = when {
-                            isConnecting -> "Verifying Handshake..."
-                            isConnected -> "Disconnect Intercom"
-                            selectedTabIndex == 1 -> "Start Hosting & Listen for Peers"
-                            else -> "Connect to Host"
+                            isConnected -> "Disconnect Voice Stream"
+                            selectedTabIndex == 1 -> "Start Server & Listen"
+                            else -> "Connect to Host IP"
                         },
                         fontSize = 15.sp,
                         fontWeight = FontWeight.Bold
