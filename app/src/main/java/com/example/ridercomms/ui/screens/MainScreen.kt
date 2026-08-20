@@ -45,6 +45,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.InputStream
 import java.io.OutputStream
 import java.nio.charset.StandardCharsets
@@ -67,10 +68,20 @@ fun MainScreen(
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
+    val prefs = remember { context.getSharedPreferences("rider_comms_prefs", Context.MODE_PRIVATE) }
+    
+    // Persistent App Rider Name
+    var riderName by remember {
+        mutableStateOf(
+            prefs.getString("rider_name", null) ?: ("Rider " + (100..999).random()).also {
+                prefs.edit().putString("rider_name", it).apply()
+            }
+        )
+    }
+
     val bluetoothManager = remember { context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager }
     val bluetoothAdapter = remember { bluetoothManager.adapter }
 
-    var riderName by remember { mutableStateOf("Rider " + (100..999).random()) }
     var selectedRole by remember { mutableStateOf(UserRole.HOST) }
     var isMuted by remember { mutableStateOf(false) }
     var isConnected by remember { mutableStateOf(false) }
@@ -193,7 +204,6 @@ fun MainScreen(
         val pUuid = ParcelUuid(RIDER_COMMS_UUID)
         val nameData = riderName.toByteArray(StandardCharsets.UTF_8)
 
-        // Split UUID and Custom Name across advertisement and scan response to stay under 31 bytes
         val advertisementData = AdvertiseData.Builder()
             .setIncludeDeviceName(false)
             .addServiceUuid(pUuid)
@@ -324,8 +334,16 @@ fun MainScreen(
                 serverSocket = bluetoothAdapter?.listenUsingInsecureRfcommWithServiceRecord("RiderCommsHost", RIDER_COMMS_UUID)
                 val socket = serverSocket?.accept()
                 if (socket != null) {
-                    pendingConnectionDevice = Pair("Rider", socket.remoteDevice)
-                    activeSocket = socket
+                    // Read client rider name from handshake stream
+                    val inputStream = socket.inputStream
+                    val nameBuffer = ByteArray(256)
+                    val bytesRead = inputStream.read(nameBuffer)
+                    val clientRiderName = if (bytesRead > 0) String(nameBuffer, 0, bytesRead, StandardCharsets.UTF_8) else "Connected Rider"
+
+                    withContext(Dispatchers.Main) {
+                        activeSocket = socket
+                        pendingConnectionDevice = Pair(clientRiderName, socket.remoteDevice)
+                    }
                 }
             } catch (e: Exception) {
                 e.printStackTrace()
@@ -345,12 +363,21 @@ fun MainScreen(
         coroutineScope.launch(Dispatchers.IO) {
             try {
                 stopBleScanning()
-                val socket = rider.device.createInsecureRfcommSocketToServiceRecord(RIDER_COMMS_UUID)
+                val targetDevice = bluetoothAdapter?.getRemoteDevice(rider.device.address) ?: rider.device
+                val socket = targetDevice.createInsecureRfcommSocketToServiceRecord(RIDER_COMMS_UUID)
                 socket.connect()
-                activeSocket = socket
-                connectedDeviceName = rider.customName
-                isConnected = true
-                startAudioStreams(socket)
+
+                // Send rider name to host immediately after connecting
+                val nameBytes = riderName.toByteArray(StandardCharsets.UTF_8)
+                socket.outputStream.write(nameBytes)
+                socket.outputStream.flush()
+
+                withContext(Dispatchers.Main) {
+                    activeSocket = socket
+                    connectedDeviceName = rider.customName
+                    isConnected = true
+                    startAudioStreams(socket)
+                }
             } catch (e: Exception) {
                 e.printStackTrace()
             }
@@ -379,7 +406,7 @@ fun MainScreen(
             },
             title = { Text("Connection Request") },
             text = {
-                Text("A nearby Rider wants to connect to your audio stream.")
+                Text("${pendingConnectionDevice?.first ?: "A nearby Rider"} wants to connect to your audio stream.")
             },
             confirmButton = {
                 Button(
@@ -456,10 +483,13 @@ fun MainScreen(
                 }
             }
 
-            // Custom App Rider Identity
+            // Custom App Rider Identity with persistence
             OutlinedTextField(
                 value = riderName,
-                onValueChange = { riderName = it },
+                onValueChange = { newName ->
+                    riderName = newName
+                    prefs.edit().putString("rider_name", newName).apply()
+                },
                 label = { Text("Your App Rider Name") },
                 leadingIcon = { Icon(Icons.Default.Edit, contentDescription = null) },
                 singleLine = true,
