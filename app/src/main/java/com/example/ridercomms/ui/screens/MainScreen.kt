@@ -69,18 +69,19 @@ fun MainScreen(
     var audioPlayJob by remember { mutableStateOf<Job?>(null) }
     var hostServerJob by remember { mutableStateOf<Job?>(null) }
 
-    // Required permissions depending on Android version
     val requiredPermissions = remember {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             arrayOf(
                 Manifest.permission.RECORD_AUDIO,
                 Manifest.permission.BLUETOOTH_SCAN,
-                Manifest.permission.BLUETOOTH_CONNECT
+                Manifest.permission.BLUETOOTH_CONNECT,
+                Manifest.permission.BLUETOOTH_ADVERTISE
             )
         } else {
             arrayOf(
                 Manifest.permission.RECORD_AUDIO,
-                Manifest.permission.ACCESS_FINE_LOCATION
+                Manifest.permission.ACCESS_FINE_LOCATION,
+                Manifest.permission.ACCESS_COARSE_LOCATION
             )
         }
     }
@@ -99,7 +100,13 @@ fun MainScreen(
         hasPermissions = permissions.values.all { it }
     }
 
-    // Audio Engine Helper
+    // Auto-prompt permissions on launch if not granted
+    LaunchedEffect(Unit) {
+        if (!hasPermissions) {
+            permissionLauncher.launch(requiredPermissions)
+        }
+    }
+
     @SuppressLint("MissingPermission")
     fun startAudioStreams(socket: BluetoothSocket) {
         val sampleRate = 16000
@@ -138,7 +145,6 @@ fun MainScreen(
         audioRecord.startRecording()
         audioTrack.play()
 
-        // Transmit Coroutine
         audioRecordJob = coroutineScope.launch(Dispatchers.IO) {
             try {
                 val outputStream: OutputStream = socket.outputStream
@@ -154,7 +160,6 @@ fun MainScreen(
             }
         }
 
-        // Receive Coroutine
         audioPlayJob = coroutineScope.launch(Dispatchers.IO) {
             try {
                 val inputStream: InputStream = socket.inputStream
@@ -188,6 +193,7 @@ fun MainScreen(
     @SuppressLint("MissingPermission")
     fun startHosting() {
         disconnectSession()
+        if (!hasPermissions) return
         hostServerJob = coroutineScope.launch(Dispatchers.IO) {
             var serverSocket: BluetoothServerSocket? = null
             try {
@@ -211,6 +217,7 @@ fun MainScreen(
 
     @SuppressLint("MissingPermission")
     fun scanAndConnectToHost(device: BluetoothDevice) {
+        if (!hasPermissions) return
         coroutineScope.launch(Dispatchers.IO) {
             try {
                 val socket = device.createInsecureRfcommSocketToServiceRecord(RIDER_COMMS_UUID)
@@ -226,7 +233,6 @@ fun MainScreen(
         }
     }
 
-    // Refresh paired Bluetooth devices
     @SuppressLint("MissingPermission")
     fun scanBluetoothDevices() {
         if (!hasPermissions || bluetoothAdapter == null || !bluetoothAdapter.isEnabled) return
@@ -234,18 +240,19 @@ fun MainScreen(
         discoveredDevices = paired.toList()
     }
 
-    DisposableEffect(selectedRole) {
-        if (selectedRole == UserRole.HOST && hasPermissions) {
-            startHosting()
-        } else {
-            scanBluetoothDevices()
+    DisposableEffect(selectedRole, hasPermissions) {
+        if (hasPermissions) {
+            if (selectedRole == UserRole.HOST) {
+                startHosting()
+            } else {
+                scanBluetoothDevices()
+            }
         }
         onDispose {
             disconnectSession()
         }
     }
 
-    // Connection Request Dialog for Host
     if (pendingConnectionDevice != null) {
         AlertDialog(
             onDismissRequest = {
@@ -332,7 +339,6 @@ fun MainScreen(
                 }
             }
 
-            // Role Selector Tabs
             TabRow(selectedTabIndex = selectedRole.ordinal) {
                 Tab(
                     selected = selectedRole == UserRole.HOST,
@@ -352,7 +358,6 @@ fun MainScreen(
                 )
             }
 
-            // Connection Status Display
             Card(modifier = Modifier.fillMaxWidth()) {
                 Column(
                     modifier = Modifier.padding(16.dp),
@@ -375,7 +380,6 @@ fun MainScreen(
                 }
             }
 
-            // Big Central Mute / Unmute Mic Button
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 colors = CardDefaults.cardColors(
@@ -407,7 +411,6 @@ fun MainScreen(
                 }
             }
 
-            // Host Search / Client Bluetooth Device List
             if (selectedRole == UserRole.CLIENT && !isConnected) {
                 Card(
                     modifier = Modifier
