@@ -18,9 +18,11 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.media.AudioAttributes
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
+import android.media.ToneGenerator
 import android.os.Build
 import android.os.ParcelUuid
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -33,6 +35,7 @@ import androidx.compose.material.icons.filled.Bluetooth
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MicOff
+import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.SportsMotorsports
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -43,9 +46,11 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.ByteArrayOutputStream
 import java.io.InputStream
 import java.io.OutputStream
 import java.nio.charset.StandardCharsets
@@ -91,6 +96,10 @@ fun MainScreen(
     var discoveredRiders by remember { mutableStateOf(listOf<DiscoveredRider>()) }
     var isScanning by remember { mutableStateOf(false) }
     var activeSocket by remember { mutableStateOf<BluetoothSocket?>(null) }
+
+    // Audio Testing State
+    var isAudioTesting by remember { mutableStateOf(false) }
+    var audioTestStatus by remember { mutableStateOf("") }
 
     val coroutineScope = rememberCoroutineScope()
     var audioRecordJob by remember { mutableStateOf<Job?>(null) }
@@ -236,8 +245,119 @@ fun MainScreen(
         isScanning = true
     }
 
+    fun playNotificationTone() {
+        try {
+            val toneGenerator = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 100)
+            toneGenerator.startTone(ToneGenerator.TONE_PROP_BEEP2, 300)
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    fun runAudioHardwareTest() {
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            permissionLauncher.launch(requiredPermissions)
+            return
+        }
+
+        coroutineScope.launch(Dispatchers.IO) {
+            withContext(Dispatchers.Main) {
+                isAudioTesting = true
+                audioTestStatus = "Recording 3s clip..."
+            }
+
+            val sampleRate = 16000
+            val channelRecord = AudioFormat.CHANNEL_IN_MONO
+            val channelPlay = AudioFormat.CHANNEL_OUT_MONO
+            val audioEncoding = AudioFormat.ENCODING_PCM_16BIT
+
+            val minRecBuf = AudioRecord.getMinBufferSize(sampleRate, channelRecord, audioEncoding)
+            val audioRecord = AudioRecord(
+                MediaRecorder.AudioSource.MIC,
+                sampleRate,
+                channelRecord,
+                audioEncoding,
+                minRecBuf * 2
+            )
+
+            val outputStream = ByteArrayOutputStream()
+            val buffer = ByteArray(minRecBuf)
+
+            try {
+                audioRecord.startRecording()
+                val startTime = System.currentTimeMillis()
+                while (System.currentTimeMillis() - startTime < 3000) {
+                    val read = audioRecord.read(buffer, 0, buffer.size)
+                    if (read > 0) {
+                        outputStream.write(buffer, 0, read)
+                    }
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+            } finally {
+                try {
+                    audioRecord.stop()
+                    audioRecord.release()
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
+            }
+
+            val recordedBytes = outputStream.toByteArray()
+
+            withContext(Dispatchers.Main) {
+                audioTestStatus = "Playing back audio..."
+            }
+
+            if (recordedBytes.isNotEmpty()) {
+                val minPlayBuf = AudioTrack.getMinBufferSize(sampleRate, channelPlay, audioEncoding)
+                val audioTrack = AudioTrack.Builder()
+                    .setAudioAttributes(
+                        AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_MEDIA)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                            .build()
+                    )
+                    .setAudioFormat(
+                        AudioFormat.Builder()
+                            .setEncoding(audioEncoding)
+                            .setSampleRate(sampleRate)
+                            .setChannelMask(channelPlay)
+                            .build()
+                    )
+                    .setBufferSizeInBytes(maxOf(minPlayBuf, recordedBytes.size))
+                    .build()
+
+                try {
+                    audioTrack.play()
+                    audioTrack.write(recordedBytes, 0, recordedBytes.size)
+                    delay(3000)
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                } finally {
+                    try {
+                        audioTrack.stop()
+                        audioTrack.release()
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                    }
+                }
+            }
+
+            withContext(Dispatchers.Main) {
+                isAudioTesting = false
+                audioTestStatus = ""
+            }
+        }
+    }
+
     @SuppressLint("MissingPermission")
     fun startAudioStreams(socket: BluetoothSocket) {
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            return
+        }
+
         val sampleRate = 16000
         val channelRecord = AudioFormat.CHANNEL_IN_MONO
         val channelPlay = AudioFormat.CHANNEL_OUT_MONO
@@ -247,11 +367,11 @@ fun MainScreen(
         val minPlayBufSize = AudioTrack.getMinBufferSize(sampleRate, channelPlay, audioEncoding)
 
         val audioRecord = AudioRecord(
-            MediaRecorder.AudioSource.VOICE_COMMUNICATION,
+            MediaRecorder.AudioSource.MIC,
             sampleRate,
             channelRecord,
             audioEncoding,
-            minRecBufSize
+            minRecBufSize * 2
         )
 
         val audioTrack = AudioTrack.Builder()
@@ -268,11 +388,15 @@ fun MainScreen(
                     .setChannelMask(channelPlay)
                     .build()
             )
-            .setBufferSizeInBytes(minPlayBufSize)
+            .setBufferSizeInBytes(minPlayBufSize * 2)
             .build()
 
-        audioRecord.startRecording()
-        audioTrack.play()
+        try {
+            audioRecord.startRecording()
+            audioTrack.play()
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
 
         audioRecordJob = coroutineScope.launch(Dispatchers.IO) {
             try {
@@ -286,6 +410,13 @@ fun MainScreen(
                 }
             } catch (e: Exception) {
                 e.printStackTrace()
+            } finally {
+                try {
+                    audioRecord.stop()
+                    audioRecord.release()
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
             }
         }
 
@@ -301,6 +432,13 @@ fun MainScreen(
                 }
             } catch (e: Exception) {
                 e.printStackTrace()
+            } finally {
+                try {
+                    audioTrack.stop()
+                    audioTrack.release()
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
             }
         }
     }
@@ -334,11 +472,21 @@ fun MainScreen(
                 serverSocket = bluetoothAdapter?.listenUsingInsecureRfcommWithServiceRecord("RiderCommsHost", RIDER_COMMS_UUID)
                 val socket = serverSocket?.accept()
                 if (socket != null) {
-                    // Read client rider name from handshake stream
+                    playNotificationTone()
+
                     val inputStream = socket.inputStream
                     val nameBuffer = ByteArray(256)
-                    val bytesRead = inputStream.read(nameBuffer)
-                    val clientRiderName = if (bytesRead > 0) String(nameBuffer, 0, bytesRead, StandardCharsets.UTF_8) else "Connected Rider"
+                    val bytesRead = try {
+                        inputStream.read(nameBuffer)
+                    } catch (e: Exception) {
+                        -1
+                    }
+
+                    val clientRiderName = if (bytesRead > 0) {
+                        String(nameBuffer, 0, bytesRead, StandardCharsets.UTF_8).trim()
+                    } else {
+                        "Nearby Rider"
+                    }
 
                     withContext(Dispatchers.Main) {
                         activeSocket = socket
@@ -367,7 +515,6 @@ fun MainScreen(
                 val socket = targetDevice.createInsecureRfcommSocketToServiceRecord(RIDER_COMMS_UUID)
                 socket.connect()
 
-                // Send rider name to host immediately after connecting
                 val nameBytes = riderName.toByteArray(StandardCharsets.UTF_8)
                 socket.outputStream.write(nameBytes)
                 socket.outputStream.flush()
@@ -404,7 +551,7 @@ fun MainScreen(
                 pendingConnectionDevice = null
                 startHosting()
             },
-            title = { Text("Connection Request") },
+            title = { Text("Rider Connection Request") },
             text = {
                 Text("${pendingConnectionDevice?.first ?: "A nearby Rider"} wants to connect to your audio stream.")
             },
@@ -420,7 +567,7 @@ fun MainScreen(
                         pendingConnectionDevice = null
                     }
                 ) {
-                    Text("Accept")
+                    Text("Accept Connection")
                 }
             },
             dismissButton = {
@@ -537,6 +684,7 @@ fun MainScreen(
                 }
             }
 
+            // Audio & Mic Control Card
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 colors = CardDefaults.cardColors(
@@ -546,18 +694,18 @@ fun MainScreen(
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(24.dp),
+                        .padding(20.dp),
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
                     IconButton(
                         onClick = { isMuted = !isMuted },
-                        modifier = Modifier.size(72.dp)
+                        modifier = Modifier.size(64.dp)
                     ) {
                         Icon(
                             imageVector = if (isMuted) Icons.Default.MicOff else Icons.Default.Mic,
                             contentDescription = if (isMuted) "Unmute Microphone" else "Mute Microphone",
-                            modifier = Modifier.size(56.dp),
+                            modifier = Modifier.size(48.dp),
                             tint = if (isMuted) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary
                         )
                     }
@@ -565,6 +713,23 @@ fun MainScreen(
                         text = if (isMuted) "Microphone Muted" else "Microphone Live",
                         style = MaterialTheme.typography.titleLarge
                     )
+
+                    // Mic & Audio Hardware Testing Option
+                    Divider(modifier = Modifier.padding(vertical = 4.dp))
+                    
+                    OutlinedButton(
+                        onClick = { runAudioHardwareTest() },
+                        enabled = !isAudioTesting && !isConnected,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(Icons.Default.GraphicEq, contentDescription = null)
+                            Text(if (isAudioTesting) audioTestStatus else "Test Mic & Speaker (3s Loop)")
+                        }
+                    }
                 }
             }
 
