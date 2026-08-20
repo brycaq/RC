@@ -105,15 +105,24 @@ fun MainScreen(
         hasPermissions = permissions.values.all { it }
     }
 
-    // Filter to ensure only smartphones/rider devices are listed (filters out headsets, speakers, cars, etc.)
+    // Filter strictly for Phones and Laptops/Computers, discarding SEOS, blank names, or raw MAC addresses
     @SuppressLint("MissingPermission")
-    fun isRiderPhone(device: BluetoothDevice): Boolean {
-        val deviceClass = device.bluetoothClass ?: return true
+    fun isAllowedRiderDevice(device: BluetoothDevice): Boolean {
+        val name = device.name
+        if (name.isNullOrBlank()) return false
+        
+        // Exclude SEOS connections or names matching raw MAC address patterns
+        if (name.contains("SEOS", ignoreCase = true)) return false
+        val macRegex = Regex("^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$")
+        if (macRegex.matches(name)) return false
+
+        val deviceClass = device.bluetoothClass ?: return false
         val major = deviceClass.majorDeviceClass
-        return major == BluetoothClass.Device.Major.PHONE || major == BluetoothClass.Device.Major.UNCATEGORIZED
+
+        return major == BluetoothClass.Device.Major.PHONE || major == BluetoothClass.Device.Major.COMPUTER
     }
 
-    // BroadcastReceiver for active Bluetooth discovery of un-paired devices
+    // BroadcastReceiver for active Bluetooth discovery
     DisposableEffect(context) {
         val receiver = object : BroadcastReceiver() {
             @SuppressLint("MissingPermission")
@@ -126,7 +135,7 @@ fun MainScreen(
                             @Suppress("DEPRECATION")
                             intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
                         }
-                        if (device != null && isRiderPhone(device)) {
+                        if (device != null && isAllowedRiderDevice(device)) {
                             if (discoveredDevices.none { it.address == device.address }) {
                                 discoveredDevices = discoveredDevices + device
                             }
@@ -301,9 +310,9 @@ fun MainScreen(
     fun scanBluetoothDevices() {
         if (!hasPermissions || bluetoothAdapter == null || !bluetoothAdapter.isEnabled) return
 
-        // Populate paired phone devices
+        // Populate paired phone/laptop devices
         val paired = bluetoothAdapter.bondedDevices ?: emptySet()
-        discoveredDevices = paired.filter { isRiderPhone(it) }
+        discoveredDevices = paired.filter { isAllowedRiderDevice(it) }
 
         // Trigger active scanning for un-paired devices nearby
         if (bluetoothAdapter.isDiscovering) {
@@ -496,7 +505,7 @@ fun MainScreen(
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Text(
-                                text = if (isScanning) "Scanning for Nearby Riders..." else "Available Bluetooth Riders",
+                                text = if (isScanning) "Scanning for Nearby Phones & Laptops..." else "Available Bluetooth Devices",
                                 style = MaterialTheme.typography.titleMedium
                             )
                             IconButton(onClick = { scanBluetoothDevices() }) {
@@ -509,7 +518,7 @@ fun MainScreen(
                                 modifier = Modifier.fillMaxSize(),
                                 contentAlignment = Alignment.Center
                             ) {
-                                Text(if (isScanning) "Scanning..." else "No Bluetooth riders found. Ensure Bluetooth is ON.")
+                                Text(if (isScanning) "Scanning..." else "No phones or laptops found. Ensure Bluetooth is ON.")
                             }
                         } else {
                             LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -526,7 +535,7 @@ fun MainScreen(
                                             verticalAlignment = Alignment.CenterVertically
                                         ) {
                                             @SuppressLint("MissingPermission")
-                                            val deviceName = device.name ?: device.address
+                                            val deviceName = device.name ?: ""
                                             Text(text = deviceName, style = MaterialTheme.typography.bodyLarge)
                                             Button(onClick = { scanAndConnectToHost(device) }) {
                                                 Text("Request Connection")
