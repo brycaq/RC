@@ -3,11 +3,15 @@ package com.example.ridercomms.ui.screens
 import android.Manifest
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothClass
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothServerSocket
 import android.bluetooth.BluetoothSocket
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.media.AudioAttributes
 import android.media.AudioFormat
@@ -62,6 +66,7 @@ fun MainScreen(
     var pendingConnectionDevice by remember { mutableStateOf<BluetoothDevice?>(null) }
 
     var discoveredDevices by remember { mutableStateOf(listOf<BluetoothDevice>()) }
+    var isScanning by remember { mutableStateOf(false) }
     var activeSocket by remember { mutableStateOf<BluetoothSocket?>(null) }
 
     val coroutineScope = rememberCoroutineScope()
@@ -100,7 +105,60 @@ fun MainScreen(
         hasPermissions = permissions.values.all { it }
     }
 
-    // Auto-prompt permissions on launch if not granted
+    // Filter to ensure only smartphones/rider devices are listed (filters out headsets, speakers, cars, etc.)
+    @SuppressLint("MissingPermission")
+    fun isRiderPhone(device: BluetoothDevice): Boolean {
+        val deviceClass = device.bluetoothClass ?: return true
+        val major = deviceClass.majorDeviceClass
+        return major == BluetoothClass.Device.Major.PHONE || major == BluetoothClass.Device.Major.UNCATEGORIZED
+    }
+
+    // BroadcastReceiver for active Bluetooth discovery of un-paired devices
+    DisposableEffect(context) {
+        val receiver = object : BroadcastReceiver() {
+            @SuppressLint("MissingPermission")
+            override fun onReceive(ctx: Context?, intent: Intent?) {
+                when (intent?.action) {
+                    BluetoothDevice.ACTION_FOUND -> {
+                        val device: BluetoothDevice? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                            intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
+                        } else {
+                            @Suppress("DEPRECATION")
+                            intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
+                        }
+                        if (device != null && isRiderPhone(device)) {
+                            if (discoveredDevices.none { it.address == device.address }) {
+                                discoveredDevices = discoveredDevices + device
+                            }
+                        }
+                    }
+                    BluetoothAdapter.ACTION_DISCOVERY_STARTED -> {
+                        isScanning = true
+                    }
+                    BluetoothAdapter.ACTION_DISCOVERY_FINISHED -> {
+                        isScanning = false
+                    }
+                }
+            }
+        }
+
+        val filter = IntentFilter().apply {
+            addAction(BluetoothDevice.ACTION_FOUND)
+            addAction(BluetoothAdapter.ACTION_DISCOVERY_STARTED)
+            addAction(BluetoothAdapter.ACTION_DISCOVERY_FINISHED)
+        }
+
+        context.registerReceiver(receiver, filter)
+
+        onDispose {
+            try {
+                context.unregisterReceiver(receiver)
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+    }
+
     LaunchedEffect(Unit) {
         if (!hasPermissions) {
             permissionLauncher.launch(requiredPermissions)
@@ -176,10 +234,14 @@ fun MainScreen(
         }
     }
 
+    @SuppressLint("MissingPermission")
     fun disconnectSession() {
         audioRecordJob?.cancel()
         audioPlayJob?.cancel()
         hostServerJob?.cancel()
+        if (bluetoothAdapter?.isDiscovering == true) {
+            bluetoothAdapter.cancelDiscovery()
+        }
         try {
             activeSocket?.close()
         } catch (e: Exception) {
@@ -220,8 +282,10 @@ fun MainScreen(
         if (!hasPermissions) return
         coroutineScope.launch(Dispatchers.IO) {
             try {
+                if (bluetoothAdapter?.isDiscovering == true) {
+                    bluetoothAdapter.cancelDiscovery()
+                }
                 val socket = device.createInsecureRfcommSocketToServiceRecord(RIDER_COMMS_UUID)
-                bluetoothAdapter?.cancelDiscovery()
                 socket.connect()
                 activeSocket = socket
                 connectedDeviceName = device.name ?: device.address
@@ -236,8 +300,16 @@ fun MainScreen(
     @SuppressLint("MissingPermission")
     fun scanBluetoothDevices() {
         if (!hasPermissions || bluetoothAdapter == null || !bluetoothAdapter.isEnabled) return
+
+        // Populate paired phone devices
         val paired = bluetoothAdapter.bondedDevices ?: emptySet()
-        discoveredDevices = paired.toList()
+        discoveredDevices = paired.filter { isRiderPhone(it) }
+
+        // Trigger active scanning for un-paired devices nearby
+        if (bluetoothAdapter.isDiscovering) {
+            bluetoothAdapter.cancelDiscovery()
+        }
+        bluetoothAdapter.startDiscovery()
     }
 
     DisposableEffect(selectedRole, hasPermissions) {
@@ -423,7 +495,10 @@ fun MainScreen(
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Text("Available Bluetooth Riders", style = MaterialTheme.typography.titleMedium)
+                            Text(
+                                text = if (isScanning) "Scanning for Nearby Riders..." else "Available Bluetooth Riders",
+                                style = MaterialTheme.typography.titleMedium
+                            )
                             IconButton(onClick = { scanBluetoothDevices() }) {
                                 Icon(Icons.Default.Bluetooth, contentDescription = "Refresh")
                             }
@@ -434,7 +509,7 @@ fun MainScreen(
                                 modifier = Modifier.fillMaxSize(),
                                 contentAlignment = Alignment.Center
                             ) {
-                                Text("No Bluetooth devices found. Ensure Bluetooth is ON.")
+                                Text(if (isScanning) "Scanning..." else "No Bluetooth riders found. Ensure Bluetooth is ON.")
                             }
                         } else {
                             LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
