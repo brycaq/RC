@@ -92,7 +92,8 @@ fun MainScreen(
                 Manifest.permission.RECORD_AUDIO,
                 Manifest.permission.BLUETOOTH_SCAN,
                 Manifest.permission.BLUETOOTH_CONNECT,
-                Manifest.permission.BLUETOOTH_ADVERTISE
+                Manifest.permission.BLUETOOTH_ADVERTISE,
+                Manifest.permission.ACCESS_FINE_LOCATION
             )
         } else {
             arrayOf(
@@ -117,7 +118,6 @@ fun MainScreen(
         hasPermissions = permissions.values.all { it }
     }
 
-    // BLE Advertiser Callback
     val advertiseCallback = remember {
         object : AdvertiseCallback() {
             override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {}
@@ -125,21 +125,27 @@ fun MainScreen(
         }
     }
 
-    // BLE Scan Callback to discover only RiderComms app broadcasts
     val scanCallback = remember {
         object : ScanCallback() {
             @SuppressLint("MissingPermission")
             override fun onScanResult(callbackType: Int, result: ScanResult?) {
                 result?.let { res ->
                     val device = res.device
-                    val serviceData = res.scanRecord?.getServiceData(ParcelUuid(RIDER_COMMS_UUID))
-                    val name = if (serviceData != null) {
+                    val pUuid = ParcelUuid(RIDER_COMMS_UUID)
+                    val serviceData = res.scanRecord?.getServiceData(pUuid)
+                    
+                    val name = if (serviceData != null && serviceData.isNotEmpty()) {
                         String(serviceData, StandardCharsets.UTF_8)
                     } else {
-                        res.scanRecord?.deviceName ?: device.name ?: "Unknown Rider"
+                        res.scanRecord?.deviceName ?: "Rider (${device.address.takeLast(5)})"
                     }
 
-                    if (discoveredRiders.none { it.device.address == device.address }) {
+                    val existingIndex = discoveredRiders.indexOfFirst { it.device.address == device.address }
+                    if (existingIndex >= 0) {
+                        val currentList = discoveredRiders.toMutableList()
+                        currentList[existingIndex] = DiscoveredRider(customName = name, device = device)
+                        discoveredRiders = currentList
+                    } else {
                         discoveredRiders = discoveredRiders + DiscoveredRider(customName = name, device = device)
                     }
                 }
@@ -187,13 +193,17 @@ fun MainScreen(
         val pUuid = ParcelUuid(RIDER_COMMS_UUID)
         val nameData = riderName.toByteArray(StandardCharsets.UTF_8)
 
-        val data = AdvertiseData.Builder()
+        // Split UUID and Custom Name across advertisement and scan response to stay under 31 bytes
+        val advertisementData = AdvertiseData.Builder()
             .setIncludeDeviceName(false)
             .addServiceUuid(pUuid)
+            .build()
+
+        val scanResponseData = AdvertiseData.Builder()
             .addServiceData(pUuid, nameData)
             .build()
 
-        advertiser.startAdvertising(settings, data, advertiseCallback)
+        advertiser.startAdvertising(settings, advertisementData, scanResponseData, advertiseCallback)
     }
 
     @SuppressLint("MissingPermission")
@@ -209,6 +219,7 @@ fun MainScreen(
 
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+            .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
             .build()
 
         scanner.startScan(listOf(filter), settings, scanCallback)
@@ -434,7 +445,7 @@ fun MainScreen(
                 ) {
                     Column(modifier = Modifier.padding(16.dp)) {
                         Text(
-                            text = "Bluetooth and Audio permissions are required to scan and connect.",
+                            text = "Bluetooth, Location, and Audio permissions are required to scan and connect.",
                             color = MaterialTheme.colorScheme.onErrorContainer
                         )
                         Spacer(modifier = Modifier.height(8.dp))
