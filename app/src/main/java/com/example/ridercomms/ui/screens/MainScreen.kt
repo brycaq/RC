@@ -1,14 +1,30 @@
 package com.example.ridercomms.ui.screens
 
 import android.Manifest
+import android.annotation.SuppressLint
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothManager
+import android.bluetooth.BluetoothServerSocket
+import android.bluetooth.BluetoothSocket
 import android.content.Context
 import android.content.pm.PackageManager
-import android.net.wifi.WifiManager
+import android.media.AudioAttributes
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.AudioTrack
+import android.media.MediaRecorder
+import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Bluetooth
+import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.MicOff
+import androidx.compose.material.icons.filled.SportsMotorsports
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -16,15 +32,19 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
-import com.example.ridercomms.network.AudioStreamManager
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import java.net.DatagramPacket
-import java.net.DatagramSocket
-import java.net.InetAddress
-import java.net.NetworkInterface
+import java.io.InputStream
+import java.io.OutputStream
+import java.util.UUID
+
+private val RIDER_COMMS_UUID: UUID = UUID.fromString("fa842880-a88f-11ed-afa1-0242ac120002")
+
+enum class UserRole {
+    HOST, CLIENT
+}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -32,114 +52,257 @@ fun MainScreen(
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
-    val audioStreamManager = remember { AudioStreamManager() }
+    val bluetoothManager = remember { context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager }
+    val bluetoothAdapter = remember { bluetoothManager.adapter }
 
-    var targetIp by remember { mutableStateOf("192.168.1.100") }
-    var targetPort by remember { mutableStateOf("50005") }
-    var isStreaming by remember { mutableStateOf(false) }
-    var isListening by remember { mutableStateOf(false) }
+    var selectedRole by remember { mutableStateOf(UserRole.HOST) }
     var isMuted by remember { mutableStateOf(false) }
-    
-    var peerTimestamps by remember { mutableStateOf(mapOf<String, Long>()) }
-    val discoveredPeers = peerTimestamps.keys.toList()
+    var isConnected by remember { mutableStateOf(false) }
+    var connectedDeviceName by remember { mutableStateOf<String?>(null) }
+    var pendingConnectionDevice by remember { mutableStateOf<BluetoothDevice?>(null) }
 
-    var hasAudioPermission by remember {
+    var discoveredDevices by remember { mutableStateOf(listOf<BluetoothDevice>()) }
+    var activeSocket by remember { mutableStateOf<BluetoothSocket?>(null) }
+
+    val coroutineScope = rememberCoroutineScope()
+    var audioRecordJob by remember { mutableStateOf<Job?>(null) }
+    var audioPlayJob by remember { mutableStateOf<Job?>(null) }
+    var hostServerJob by remember { mutableStateOf<Job?>(null) }
+
+    // Required permissions depending on Android version
+    val requiredPermissions = remember {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            arrayOf(
+                Manifest.permission.RECORD_AUDIO,
+                Manifest.permission.BLUETOOTH_SCAN,
+                Manifest.permission.BLUETOOTH_CONNECT
+            )
+        } else {
+            arrayOf(
+                Manifest.permission.RECORD_AUDIO,
+                Manifest.permission.ACCESS_FINE_LOCATION
+            )
+        }
+    }
+
+    var hasPermissions by remember {
         mutableStateOf(
-            ContextCompat.checkSelfPermission(
-                context,
-                Manifest.permission.RECORD_AUDIO
-            ) == PackageManager.PERMISSION_GRANTED
+            requiredPermissions.all {
+                ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED
+            }
         )
     }
 
     val permissionLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.RequestPermission()
-    ) { isGranted ->
-        hasAudioPermission = isGranted
+        contract = ActivityResultContracts.RequestMultiplePermissions()
+    ) { permissions ->
+        hasPermissions = permissions.values.all { it }
     }
 
-    // UDP Peer Discovery Engine (Broadcaster & Receiver)
-    LaunchedEffect(Unit) {
-        val discoveryPort = 50006
-        val beaconMessage = "RIDER_COMMS_BEACON".toByteArray()
+    // Audio Engine Helper
+    @SuppressLint("MissingPermission")
+    fun startAudioStreams(socket: BluetoothSocket) {
+        val sampleRate = 16000
+        val channelRecord = AudioFormat.CHANNEL_IN_MONO
+        val channelPlay = AudioFormat.CHANNEL_OUT_MONO
+        val audioEncoding = AudioFormat.ENCODING_PCM_16BIT
 
-        // 1. Broadcaster Coroutine
-        launch(Dispatchers.IO) {
-            val wifiManager = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
-            val multicastLock = wifiManager?.createMulticastLock("RiderCommsDiscovery")
-            multicastLock?.acquire()
+        val minRecBufSize = AudioRecord.getMinBufferSize(sampleRate, channelRecord, audioEncoding)
+        val minPlayBufSize = AudioTrack.getMinBufferSize(sampleRate, channelPlay, audioEncoding)
 
+        val audioRecord = AudioRecord(
+            MediaRecorder.AudioSource.VOICE_COMMUNICATION,
+            sampleRate,
+            channelRecord,
+            audioEncoding,
+            minRecBufSize
+        )
+
+        val audioTrack = AudioTrack.Builder()
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build()
+            )
+            .setAudioFormat(
+                AudioFormat.Builder()
+                    .setEncoding(audioEncoding)
+                    .setSampleRate(sampleRate)
+                    .setChannelMask(channelPlay)
+                    .build()
+            )
+            .setBufferSizeInBytes(minPlayBufSize)
+            .build()
+
+        audioRecord.startRecording()
+        audioTrack.play()
+
+        // Transmit Coroutine
+        audioRecordJob = coroutineScope.launch(Dispatchers.IO) {
             try {
-                val socket = DatagramSocket()
-                socket.broadcast = true
-
-                while (isActive) {
-                    try {
-                        val broadcastAddr = InetAddress.getByName("255.255.255.255")
-                        val packet = DatagramPacket(beaconMessage, beaconMessage.size, broadcastAddr, discoveryPort)
-                        socket.send(packet)
-                    } catch (e: Exception) {
-                        e.printStackTrace()
-                    }
-                    delay(2000)
-                }
-                socket.close()
-            } finally {
-                if (multicastLock?.isHeld == true) {
-                    multicastLock.release()
-                }
-            }
-        }
-
-        // 2. Listener Coroutine
-        launch(Dispatchers.IO) {
-            try {
-                val socket = DatagramSocket(discoveryPort)
-                socket.broadcast = true
-                val buffer = ByteArray(1024)
-
-                while (isActive) {
-                    val packet = DatagramPacket(buffer, buffer.size)
-                    socket.receive(packet)
-                    val receivedStr = String(packet.data, 0, packet.length)
-
-                    if (receivedStr.startsWith("RIDER_COMMS_BEACON")) {
-                        val senderIp = packet.address.hostAddress
-                        if (senderIp != null && !isLocalIp(senderIp)) {
-                            val currentTime = System.currentTimeMillis()
-                            peerTimestamps = peerTimestamps.toMutableMap().apply {
-                                put(senderIp, currentTime)
-                            }
-                        }
+                val outputStream: OutputStream = socket.outputStream
+                val buffer = ByteArray(minRecBufSize)
+                while (isActive && socket.isConnected) {
+                    val read = audioRecord.read(buffer, 0, buffer.size)
+                    if (read > 0 && !isMuted) {
+                        outputStream.write(buffer, 0, read)
                     }
                 }
-                socket.close()
             } catch (e: Exception) {
                 e.printStackTrace()
             }
         }
 
-        // 3. Stale Peer Cleanup Coroutine
-        launch(Dispatchers.IO) {
-            while (isActive) {
-                delay(4000)
-                val now = System.currentTimeMillis()
-                peerTimestamps = peerTimestamps.filterValues { now - it < 6000 }
+        // Receive Coroutine
+        audioPlayJob = coroutineScope.launch(Dispatchers.IO) {
+            try {
+                val inputStream: InputStream = socket.inputStream
+                val buffer = ByteArray(minPlayBufSize)
+                while (isActive && socket.isConnected) {
+                    val read = inputStream.read(buffer)
+                    if (read > 0) {
+                        audioTrack.write(buffer, 0, read)
+                    }
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
             }
         }
     }
 
-    DisposableEffect(Unit) {
-        onDispose {
-            audioStreamManager.stopRecording()
-            audioStreamManager.stopPlaying()
+    fun disconnectSession() {
+        audioRecordJob?.cancel()
+        audioPlayJob?.cancel()
+        hostServerJob?.cancel()
+        try {
+            activeSocket?.close()
+        } catch (e: Exception) {
+            e.printStackTrace()
         }
+        activeSocket = null
+        isConnected = false
+        connectedDeviceName = null
+    }
+
+    @SuppressLint("MissingPermission")
+    fun startHosting() {
+        disconnectSession()
+        hostServerJob = coroutineScope.launch(Dispatchers.IO) {
+            var serverSocket: BluetoothServerSocket? = null
+            try {
+                serverSocket = bluetoothAdapter?.listenInsecureRfcommWithServiceRecord("RiderCommsHost", RIDER_COMMS_UUID)
+                val socket = serverSocket?.accept()
+                if (socket != null) {
+                    pendingConnectionDevice = socket.remoteDevice
+                    activeSocket = socket
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+            } finally {
+                try {
+                    serverSocket?.close()
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
+            }
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    fun scanAndConnectToHost(device: BluetoothDevice) {
+        coroutineScope.launch(Dispatchers.IO) {
+            try {
+                val socket = device.createInsecureRfcommSocketToServiceRecord(RIDER_COMMS_UUID)
+                bluetoothAdapter?.cancelDiscovery()
+                socket.connect()
+                activeSocket = socket
+                connectedDeviceName = device.name ?: device.address
+                isConnected = true
+                startAudioStreams(socket)
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+    }
+
+    // Refresh paired Bluetooth devices
+    @SuppressLint("MissingPermission")
+    fun scanBluetoothDevices() {
+        if (!hasPermissions || bluetoothAdapter == null || !bluetoothAdapter.isEnabled) return
+        val paired = bluetoothAdapter.bondedDevices ?: emptySet()
+        discoveredDevices = paired.toList()
+    }
+
+    DisposableEffect(selectedRole) {
+        if (selectedRole == UserRole.HOST && hasPermissions) {
+            startHosting()
+        } else {
+            scanBluetoothDevices()
+        }
+        onDispose {
+            disconnectSession()
+        }
+    }
+
+    // Connection Request Dialog for Host
+    if (pendingConnectionDevice != null) {
+        AlertDialog(
+            onDismissRequest = {
+                disconnectSession()
+                pendingConnectionDevice = null
+                startHosting()
+            },
+            title = { Text("Connection Request") },
+            text = {
+                Text("${pendingConnectionDevice?.name ?: "A Rider"} wants to connect to your audio stream.")
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val socket = activeSocket
+                        if (socket != null) {
+                            connectedDeviceName = pendingConnectionDevice?.name ?: pendingConnectionDevice?.address
+                            isConnected = true
+                            startAudioStreams(socket)
+                        }
+                        pendingConnectionDevice = null
+                    }
+                ) {
+                    Text("Accept")
+                }
+            },
+            dismissButton = {
+                OutlinedButton(
+                    onClick = {
+                        disconnectSession()
+                        pendingConnectionDevice = null
+                        startHosting()
+                    }
+                ) {
+                    Text("Decline")
+                }
+            }
+        )
     }
 
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("RiderComms") }
+                title = {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.SportsMotorsports,
+                            contentDescription = "RiderComms Helmet Logo",
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(32.dp)
+                        )
+                        Text("RiderComms")
+                    }
+                }
             )
         }
     ) { innerPadding ->
@@ -148,241 +311,148 @@ fun MainScreen(
                 .fillMaxSize()
                 .padding(innerPadding)
                 .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(16.dp)
+            verticalArrangement = Arrangement.spacedBy(16.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            if (!hasAudioPermission) {
+            if (!hasPermissions) {
                 Card(
-                    colors = CardDefaults.cardColors(
-                        containerColor = MaterialTheme.colorScheme.errorContainer
-                    ),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     Column(modifier = Modifier.padding(16.dp)) {
                         Text(
-                            text = "Microphone permission is required for audio communication.",
-                            style = MaterialTheme.typography.bodyMedium,
+                            text = "Bluetooth and Audio permissions are required to scan and connect.",
                             color = MaterialTheme.colorScheme.onErrorContainer
                         )
                         Spacer(modifier = Modifier.height(8.dp))
-                        Button(onClick = {
-                            permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
-                        }) {
-                            Text("Grant Permission")
+                        Button(onClick = { permissionLauncher.launch(requiredPermissions) }) {
+                            Text("Grant Permissions")
                         }
                     }
                 }
             }
 
-            Card(
-                modifier = Modifier.fillMaxWidth()
-            ) {
+            // Role Selector Tabs
+            TabRow(selectedTabIndex = selectedRole.ordinal) {
+                Tab(
+                    selected = selectedRole == UserRole.HOST,
+                    onClick = {
+                        selectedRole = UserRole.HOST
+                        startHosting()
+                    },
+                    text = { Text("Host Session") }
+                )
+                Tab(
+                    selected = selectedRole == UserRole.CLIENT,
+                    onClick = {
+                        selectedRole = UserRole.CLIENT
+                        scanBluetoothDevices()
+                    },
+                    text = { Text("Join Session") }
+                )
+            }
+
+            // Connection Status Display
+            Card(modifier = Modifier.fillMaxWidth()) {
                 Column(
                     modifier = Modifier.padding(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                    horizontalAlignment = Alignment.CenterHorizontally
                 ) {
                     Text(
-                        text = "Connection Settings",
+                        text = if (isConnected) "Connected with $connectedDeviceName" else if (selectedRole == UserRole.HOST) "Waiting for incoming rider request..." else "Select a host rider to connect",
                         style = MaterialTheme.typography.titleMedium
                     )
 
-                    OutlinedTextField(
-                        value = targetIp,
-                        onValueChange = { targetIp = it },
-                        label = { Text("Target IP Address") },
-                        modifier = Modifier.fillMaxWidth(),
-                        singleLine = true
-                    )
-
-                    OutlinedTextField(
-                        value = targetPort,
-                        onValueChange = { targetPort = it },
-                        label = { Text("Port") },
-                        modifier = Modifier.fillMaxWidth(),
-                        singleLine = true
-                    )
+                    if (isConnected) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        OutlinedButton(onClick = {
+                            disconnectSession()
+                            if (selectedRole == UserRole.HOST) startHosting()
+                        }) {
+                            Text("End Session")
+                        }
+                    }
                 }
             }
 
+            // Big Central Mute / Unmute Mic Button
             Card(
-                modifier = Modifier.fillMaxWidth()
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(
+                    containerColor = if (isMuted) MaterialTheme.colorScheme.errorContainer else MaterialTheme.colorScheme.primaryContainer
+                )
             ) {
                 Column(
-                    modifier = Modifier.padding(16.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(24.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
-                    Text(
-                        text = "Audio Controls",
-                        style = MaterialTheme.typography.titleMedium
-                    )
-
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
+                    IconButton(
+                        onClick = { isMuted = !isMuted },
+                        modifier = Modifier.size(72.dp)
                     ) {
-                        Text("Transmit Audio")
-                        Button(
-                            onClick = {
-                                if (isStreaming) {
-                                    audioStreamManager.stopRecording()
-                                    isStreaming = false
-                                } else {
-                                    if (hasAudioPermission) {
-                                        val port = targetPort.toIntOrNull() ?: 50005
-                                        audioStreamManager.startRecording(targetIp, port)
-                                        isStreaming = true
-                                    } else {
-                                        permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
-                                    }
-                                }
-                            },
-                            colors = if (isStreaming) {
-                                ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
-                            } else {
-                                ButtonDefaults.buttonColors()
-                            }
-                        ) {
-                            Text(if (isStreaming) "Stop Transmitting" else "Start Transmitting")
-                        }
-                    }
-
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text("Receive Audio")
-                        Button(
-                            onClick = {
-                                if (isListening) {
-                                    audioStreamManager.stopPlaying()
-                                    isListening = false
-                                } else {
-                                    val port = targetPort.toIntOrNull() ?: 50005
-                                    audioStreamManager.startPlaying(port)
-                                    isListening = true
-                                }
-                            },
-                            colors = if (isListening) {
-                                ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondary)
-                            } else {
-                                ButtonDefaults.buttonColors()
-                            }
-                        ) {
-                            Text(if (isListening) "Stop Listening" else "Start Listening")
-                        }
-                    }
-
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text("Mute Microphone")
-                        Switch(
-                            checked = isMuted,
-                            onCheckedChange = { muted ->
-                                isMuted = muted
-                                if (muted && isStreaming) {
-                                    audioStreamManager.stopRecording()
-                                } else if (!muted && isStreaming) {
-                                    val port = targetPort.toIntOrNull() ?: 50005
-                                    audioStreamManager.startRecording(targetIp, port)
-                                }
-                            }
+                        Icon(
+                            imageVector = if (isMuted) Icons.Default.MicOff else Icons.Default.Mic,
+                            contentDescription = if (isMuted) "Unmute Microphone" else "Mute Microphone",
+                            modifier = Modifier.size(56.dp),
+                            tint = if (isMuted) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary
                         )
                     }
+                    Text(
+                        text = if (isMuted) "Microphone Muted" else "Microphone Live",
+                        style = MaterialTheme.typography.titleLarge
+                    )
                 }
             }
 
-            Card(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .weight(1f)
-            ) {
-                Column(
-                    modifier = Modifier.padding(16.dp)
+            // Host Search / Client Bluetooth Device List
+            if (selectedRole == UserRole.CLIENT && !isConnected) {
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f)
                 ) {
-                    Text(
-                        text = "Discovered Peers",
-                        style = MaterialTheme.typography.titleMedium,
-                        modifier = Modifier.padding(bottom = 8.dp)
-                    )
-
-                    if (discoveredPeers.isEmpty()) {
-                        Box(
-                            modifier = Modifier.fillMaxSize(),
-                            contentAlignment = Alignment.Center
+                    Column(modifier = Modifier.padding(16.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Text(
-                                text = "Scanning for peers on local network...",
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
+                            Text("Available Bluetooth Riders", style = MaterialTheme.typography.titleMedium)
+                            IconButton(onClick = { scanBluetoothDevices() }) {
+                                Icon(Icons.Default.Bluetooth, contentDescription = "Refresh")
+                            }
                         }
-                    } else {
-                        LazyColumn(
-                            verticalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            items(discoveredPeers) { peerIp ->
-                                val isConnected = targetIp == peerIp && (isStreaming || isListening)
-                                Card(
-                                    onClick = {
-                                        targetIp = peerIp
-                                        val port = targetPort.toIntOrNull() ?: 50005
 
-                                        audioStreamManager.stopRecording()
-                                        audioStreamManager.stopPlaying()
-
-                                        if (hasAudioPermission && !isMuted) {
-                                            audioStreamManager.startRecording(peerIp, port)
-                                            isStreaming = true
-                                        }
-                                        audioStreamManager.startPlaying(port)
-                                        isListening = true
-                                    },
-                                    colors = if (isConnected) {
-                                        CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
-                                    } else {
-                                        CardDefaults.cardColors()
-                                    },
-                                    modifier = Modifier.fillMaxWidth()
-                                ) {
-                                    Row(
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .padding(12.dp),
-                                        horizontalArrangement = Arrangement.SpaceBetween,
-                                        verticalAlignment = Alignment.CenterVertically
+                        if (discoveredDevices.isEmpty()) {
+                            Box(
+                                modifier = Modifier.fillMaxSize(),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text("No Bluetooth devices found. Ensure Bluetooth is ON.")
+                            }
+                        } else {
+                            LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                items(discoveredDevices) { device ->
+                                    Card(
+                                        onClick = { scanAndConnectToHost(device) },
+                                        modifier = Modifier.fillMaxWidth()
                                     ) {
-                                        Column {
-                                            Text(
-                                                text = peerIp,
-                                                style = MaterialTheme.typography.bodyLarge
-                                            )
-                                            Text(
-                                                text = if (isConnected) "Connected & Streaming" else "Available",
-                                                style = MaterialTheme.typography.labelSmall,
-                                                color = if (isConnected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
-                                            )
-                                        }
-                                        Button(
-                                            onClick = {
-                                                targetIp = peerIp
-                                                val port = targetPort.toIntOrNull() ?: 50005
-
-                                                audioStreamManager.stopRecording()
-                                                audioStreamManager.stopPlaying()
-
-                                                if (hasAudioPermission && !isMuted) {
-                                                    audioStreamManager.startRecording(peerIp, port)
-                                                    isStreaming = true
-                                                }
-                                                audioStreamManager.startPlaying(port)
-                                                isListening = true
-                                            }
+                                        Row(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .padding(12.dp),
+                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                            verticalAlignment = Alignment.CenterVertically
                                         ) {
-                                            Text(if (isConnected) "Active" else "Connect")
+                                            @SuppressLint("MissingPermission")
+                                            val deviceName = device.name ?: device.address
+                                            Text(text = deviceName, style = MaterialTheme.typography.bodyLarge)
+                                            Button(onClick = { scanAndConnectToHost(device) }) {
+                                                Text("Request Connection")
+                                            }
                                         }
                                     }
                                 }
@@ -393,23 +463,4 @@ fun MainScreen(
             }
         }
     }
-}
-
-private fun isLocalIp(ip: String): Boolean {
-    try {
-        val interfaces = NetworkInterface.getNetworkInterfaces()
-        while (interfaces.hasMoreElements()) {
-            val networkInterface = interfaces.nextElement()
-            val addresses = networkInterface.inetAddresses
-            while (addresses.hasMoreElements()) {
-                val addr = addresses.nextElement()
-                if (!addr.isLoopbackAddress && addr.hostAddress == ip) {
-                    return true
-                }
-            }
-        }
-    } catch (e: Exception) {
-        e.printStackTrace()
-    }
-    return false
 }
