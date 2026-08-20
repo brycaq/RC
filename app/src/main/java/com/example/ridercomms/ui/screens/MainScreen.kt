@@ -7,14 +7,10 @@ import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothServerSocket
 import android.bluetooth.BluetoothSocket
-import android.bluetooth.le.AdvertiseCallback
-import android.bluetooth.le.AdvertiseData
-import android.bluetooth.le.AdvertiseSettings
-import android.bluetooth.le.ScanCallback
-import android.bluetooth.le.ScanFilter
-import android.bluetooth.le.ScanResult
-import android.bluetooth.le.ScanSettings
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.media.AudioAttributes
 import android.media.AudioFormat
@@ -24,7 +20,6 @@ import android.media.AudioTrack
 import android.media.MediaRecorder
 import android.media.ToneGenerator
 import android.os.Build
-import android.os.ParcelUuid
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
@@ -74,8 +69,7 @@ fun MainScreen(
 ) {
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences("rider_comms_prefs", Context.MODE_PRIVATE) }
-    
-    // Persistent App Rider Name
+
     var riderName by remember {
         mutableStateOf(
             prefs.getString("rider_name", null) ?: ("Rider " + (100..999).random()).also {
@@ -98,7 +92,6 @@ fun MainScreen(
     var isScanning by remember { mutableStateOf(false) }
     var activeSocket by remember { mutableStateOf<BluetoothSocket?>(null) }
 
-    // Audio Testing State
     var isAudioTesting by remember { mutableStateOf(false) }
     var audioTestStatus by remember { mutableStateOf("") }
 
@@ -139,37 +132,40 @@ fun MainScreen(
         hasPermissions = permissions.values.all { it }
     }
 
-    val advertiseCallback = remember {
-        object : AdvertiseCallback() {
-            override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {}
-            override fun onStartFailure(errorCode: Int) {}
-        }
-    }
-
-    val scanCallback = remember {
-        object : ScanCallback() {
+    // Classic Bluetooth Receiver to fetch BR/EDR addresses for RFCOMM
+    DisposableEffect(context) {
+        val receiver = object : BroadcastReceiver() {
             @SuppressLint("MissingPermission")
-            override fun onScanResult(callbackType: Int, result: ScanResult?) {
-                result?.let { res ->
-                    val device = res.device
-                    val pUuid = ParcelUuid(RIDER_COMMS_UUID)
-                    val serviceData = res.scanRecord?.getServiceData(pUuid)
-                    
-                    val name = if (serviceData != null && serviceData.isNotEmpty()) {
-                        String(serviceData, StandardCharsets.UTF_8)
-                    } else {
-                        res.scanRecord?.deviceName ?: "Rider (${device.address.takeLast(5)})"
+            override fun onReceive(context: Context?, intent: Intent?) {
+                when (intent?.action) {
+                    BluetoothDevice.ACTION_FOUND -> {
+                        val device: BluetoothDevice? = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
+                        device?.let { dev ->
+                            val devName = dev.name ?: "Rider (${dev.address.takeLast(5)})"
+                            val existingIndex = discoveredRiders.indexOfFirst { it.device.address == dev.address }
+                            if (existingIndex < 0) {
+                                discoveredRiders = discoveredRiders + DiscoveredRider(customName = devName, device = dev)
+                            }
+                        }
                     }
-
-                    val existingIndex = discoveredRiders.indexOfFirst { it.device.address == device.address }
-                    if (existingIndex >= 0) {
-                        val currentList = discoveredRiders.toMutableList()
-                        currentList[existingIndex] = DiscoveredRider(customName = name, device = device)
-                        discoveredRiders = currentList
-                    } else {
-                        discoveredRiders = discoveredRiders + DiscoveredRider(customName = name, device = device)
+                    BluetoothAdapter.ACTION_DISCOVERY_FINISHED -> {
+                        isScanning = false
                     }
                 }
+            }
+        }
+
+        val filter = IntentFilter().apply {
+            addAction(BluetoothDevice.ACTION_FOUND)
+            addAction(BluetoothAdapter.ACTION_DISCOVERY_FINISHED)
+        }
+        context.registerReceiver(receiver, filter)
+
+        onDispose {
+            try {
+                context.unregisterReceiver(receiver)
+            } catch (e: Exception) {
+                e.printStackTrace()
             }
         }
     }
@@ -181,68 +177,29 @@ fun MainScreen(
     }
 
     @SuppressLint("MissingPermission")
-    fun stopBleAdvertising() {
+    fun stopClassicDiscovery() {
         try {
-            bluetoothAdapter?.bluetoothLeAdvertiser?.stopAdvertising(advertiseCallback)
+            if (bluetoothAdapter?.isDiscovering == true) {
+                bluetoothAdapter.cancelDiscovery()
+            }
         } catch (e: Exception) {
-            e.printStackTrace()
-        }
-    }
-
-    @SuppressLint("MissingPermission")
-    fun stopBleScanning() {
-        try {
-            bluetoothAdapter?.bluetoothLeScanner?.stopScan(scanCallback)
-        } catch (e: Exception) {
-            e.printStackTrace()
+            e.printStackTrace Jackson
         }
         isScanning = false
     }
 
     @SuppressLint("MissingPermission")
-    fun startBleAdvertising() {
+    fun startClassicDiscovery() {
         if (!hasPermissions || bluetoothAdapter == null || !bluetoothAdapter.isEnabled) return
-        stopBleAdvertising()
-
-        val advertiser = bluetoothAdapter.bluetoothLeAdvertiser ?: return
-        val settings = AdvertiseSettings.Builder()
-            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
-            .setConnectable(true)
-            .setTimeout(0)
-            .build()
-
-        val pUuid = ParcelUuid(RIDER_COMMS_UUID)
-        val nameData = riderName.toByteArray(StandardCharsets.UTF_8)
-
-        val advertisementData = AdvertiseData.Builder()
-            .setIncludeDeviceName(false)
-            .addServiceUuid(pUuid)
-            .build()
-
-        val scanResponseData = AdvertiseData.Builder()
-            .addServiceData(pUuid, nameData)
-            .build()
-
-        advertiser.startAdvertising(settings, advertisementData, scanResponseData, advertiseCallback)
-    }
-
-    @SuppressLint("MissingPermission")
-    fun startBleScanning() {
-        if (!hasPermissions || bluetoothAdapter == null || !bluetoothAdapter.isEnabled) return
-        stopBleScanning()
+        stopClassicDiscovery()
         discoveredRiders = emptyList()
 
-        val scanner = bluetoothAdapter.bluetoothLeScanner ?: return
-        val filter = ScanFilter.Builder()
-            .setServiceUuid(ParcelUuid(RIDER_COMMS_UUID))
-            .build()
+        // Include paired paired devices directly
+        val paired = bluetoothAdapter.bondedDevices ?: emptySet()
+        val pairedRiders = paired.map { DiscoveredRider(it.name ?: "Paired Rider", it) }
+        discoveredRiders = pairedRiders
 
-        val settings = ScanSettings.Builder()
-            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
-            .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
-            .build()
-
-        scanner.startScan(listOf(filter), settings, scanCallback)
+        bluetoothAdapter.startDiscovery()
         isScanning = true
     }
 
@@ -449,8 +406,7 @@ fun MainScreen(
         audioRecordJob?.cancel()
         audioPlayJob?.cancel()
         hostServerJob?.cancel()
-        stopBleAdvertising()
-        stopBleScanning()
+        stopClassicDiscovery()
         try {
             activeSocket?.close()
         } catch (e: Exception) {
@@ -466,14 +422,18 @@ fun MainScreen(
     fun startHosting() {
         disconnectSession()
         if (!hasPermissions) return
-        startBleAdvertising()
 
         hostServerJob = coroutineScope.launch(Dispatchers.IO) {
             var serverSocket: BluetoothServerSocket? = null
-            while (isActive && !isConnected) {
-                try {
-                    serverSocket = bluetoothAdapter?.listenUsingInsecureRfcommWithServiceRecord("RiderCommsHost", RIDER_COMMS_UUID)
-                    val socket = serverSocket?.accept()
+            try {
+                serverSocket = bluetoothAdapter?.listenUsingInsecureRfcommWithServiceRecord("RiderCommsHost", RIDER_COMMS_UUID)
+                while (isActive && !isConnected) {
+                    val socket = try {
+                        serverSocket?.accept()
+                    } catch (e: Exception) {
+                        null
+                    }
+
                     if (socket != null) {
                         playNotificationTone()
 
@@ -496,15 +456,14 @@ fun MainScreen(
                         }
                         break
                     }
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+            } finally {
+                try {
+                    serverSocket?.close()
                 } catch (e: Exception) {
                     e.printStackTrace()
-                    delay(1000)
-                } finally {
-                    try {
-                        serverSocket?.close()
-                    } catch (e: Exception) {
-                        e.printStackTrace()
-                    }
                 }
             }
         }
@@ -518,37 +477,35 @@ fun MainScreen(
                 connectionStatusMsg = "Handshaking with ${rider.customName}... Waiting for Host approval."
             }
             try {
-                stopBleScanning()
-                bluetoothAdapter?.cancelDiscovery()
+                stopClassicDiscovery()
 
                 val targetDevice = bluetoothAdapter?.getRemoteDevice(rider.device.address) ?: rider.device
                 var socket: BluetoothSocket? = null
 
-                // Connection attempt with reflection fallback for unpaired devices
+                // Connection attempt sequence for classic RFCOMM sockets
                 try {
                     socket = targetDevice.createInsecureRfcommSocketToServiceRecord(RIDER_COMMS_UUID)
                     socket.connect()
-                } catch (e: Exception) {
-                    e.printStackTrace()
+                } catch (e1: Exception) {
+                    e1.printStackTrace()
                     try {
                         val m = targetDevice.javaClass.getMethod("createInsecureRfcommSocket", Int::class.javaPrimitiveType)
                         socket = m.invoke(targetDevice, 1) as BluetoothSocket
                         socket.connect()
                     } catch (e2: Exception) {
                         e2.printStackTrace()
-                        val m = targetDevice.javaClass.getMethod("createRfcommSocket", Int::class.javaPrimitiveType)
-                        socket = m.invoke(targetDevice, 1) as BluetoothSocket
+                        socket = targetDevice.createRfcommSocketToServiceRecord(RIDER_COMMS_UUID)
                         socket.connect()
                     }
                 }
 
                 if (socket != null && socket.isConnected) {
-                    // Step 1: Send client rider name handshake request
+                    // Send joiner handshake request
                     val nameBytes = riderName.toByteArray(StandardCharsets.UTF_8)
                     socket.outputStream.write(nameBytes)
                     socket.outputStream.flush()
 
-                    // Step 2: Wait for Host Permission Confirmation byte (1 = Allowed, 0 = Declined)
+                    // Wait for Host response (1 = Allowed, 0 = Declined)
                     val responseByte = socket.inputStream.read()
                     if (responseByte == 1) {
                         withContext(Dispatchers.Main) {
@@ -566,7 +523,7 @@ fun MainScreen(
                     }
                 } else {
                     withContext(Dispatchers.Main) {
-                        connectionStatusMsg = "Unable to establish socket connection with Host."
+                        connectionStatusMsg = "Unable to open RFCOMM socket connection."
                     }
                 }
             } catch (e: Exception) {
@@ -583,7 +540,7 @@ fun MainScreen(
             if (selectedRole == UserRole.HOST) {
                 startHosting()
             } else {
-                startBleScanning()
+                startClassicDiscovery()
             }
         }
         onDispose {
@@ -591,14 +548,14 @@ fun MainScreen(
         }
     }
 
-    // Host Permission Ask Dialog
+    // Host Permission Prompt Dialog
     if (pendingConnectionDevice != null) {
         val (clientName, socket) = pendingConnectionDevice!!
         AlertDialog(
             onDismissRequest = {
                 coroutineScope.launch(Dispatchers.IO) {
                     try {
-                        socket.outputStream.write(0) // Decline ACK
+                        socket.outputStream.write(0)
                         socket.outputStream.flush()
                         socket.close()
                     } catch (e: Exception) {
@@ -610,14 +567,14 @@ fun MainScreen(
             },
             title = { Text("Rider Connection Request") },
             text = {
-                Text("$clientName is asking for permission to join your intercom session. Allow connection?")
+                Text("$clientName is requesting permission to join your intercom session. Allow connection?")
             },
             confirmButton = {
                 Button(
                     onClick = {
                         coroutineScope.launch(Dispatchers.IO) {
                             try {
-                                socket.outputStream.write(1) // Allowed ACK
+                                socket.outputStream.write(1)
                                 socket.outputStream.flush()
                                 withContext(Dispatchers.Main) {
                                     activeSocket = socket
@@ -640,7 +597,7 @@ fun MainScreen(
                     onClick = {
                         coroutineScope.launch(Dispatchers.IO) {
                             try {
-                                socket.outputStream.write(0) // Decline ACK
+                                socket.outputStream.write(0)
                                 socket.outputStream.flush()
                                 socket.close()
                             } catch (e: Exception) {
@@ -703,7 +660,6 @@ fun MainScreen(
                 }
             }
 
-            // Custom App Rider Identity with persistence
             OutlinedTextField(
                 value = riderName,
                 onValueChange = { newName ->
@@ -729,7 +685,7 @@ fun MainScreen(
                     selected = selectedRole == UserRole.CLIENT,
                     onClick = {
                         selectedRole = UserRole.CLIENT
-                        startBleScanning()
+                        startClassicDiscovery()
                     },
                     text = { Text("Join Session") }
                 )
@@ -741,7 +697,7 @@ fun MainScreen(
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
                     Text(
-                        text = if (isConnected) "Connected with $connectedDeviceName" else if (selectedRole == UserRole.HOST) "Broadcasting app ID as '$riderName'..." else connectionStatusMsg ?: "Select a rider using RiderComms",
+                        text = if (isConnected) "Connected with $connectedDeviceName" else if (selectedRole == UserRole.HOST) "Listening for incoming rider connections..." else connectionStatusMsg ?: "Select a rider using RiderComms",
                         style = MaterialTheme.typography.titleMedium
                     )
 
@@ -757,7 +713,6 @@ fun MainScreen(
                 }
             }
 
-            // Audio & Mic Control Card
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 colors = CardDefaults.cardColors(
@@ -787,9 +742,8 @@ fun MainScreen(
                         style = MaterialTheme.typography.titleLarge
                     )
 
-                    // Mic & Audio Hardware Testing Option
                     Divider(modifier = Modifier.padding(vertical = 4.dp))
-                    
+
                     OutlinedButton(
                         onClick = { runAudioHardwareTest() },
                         enabled = !isAudioTesting && !isConnected,
@@ -819,10 +773,10 @@ fun MainScreen(
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Text(
-                                text = if (isScanning) "Searching for RiderComms Apps..." else "Available RiderComms Devices",
+                                text = if (isScanning) "Searching Classic Bluetooth Devices..." else "Available Bluetooth Devices",
                                 style = MaterialTheme.typography.titleMedium
                             )
-                            IconButton(onClick = { startBleScanning() }) {
+                            IconButton(onClick = { startClassicDiscovery() }) {
                                 Icon(Icons.Default.Bluetooth, contentDescription = "Refresh")
                             }
                         }
@@ -832,7 +786,7 @@ fun MainScreen(
                                 modifier = Modifier.fillMaxSize(),
                                 contentAlignment = Alignment.Center
                             ) {
-                                Text(if (isScanning) "Scanning for nearby RiderComms riders..." else "No RiderComms riders found.")
+                                Text(if (isScanning) "Scanning for nearby devices..." else "No devices found.")
                             }
                         } else {
                             LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
