@@ -1,7 +1,9 @@
 package com.example.ridercomms.ui.screens
 
 import android.Manifest
+import android.content.Context
 import android.content.pm.PackageManager
+import android.net.wifi.WifiManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
@@ -15,6 +17,14 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.example.ridercomms.network.AudioStreamManager
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.InetAddress
+import java.net.NetworkInterface
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -29,7 +39,9 @@ fun MainScreen(
     var isStreaming by remember { mutableStateOf(false) }
     var isListening by remember { mutableStateOf(false) }
     var isMuted by remember { mutableStateOf(false) }
-    var discoveredPeers by remember { mutableStateOf(listOf<String>()) }
+    
+    var peerTimestamps by remember { mutableStateOf(mapOf<String, Long>()) }
+    val discoveredPeers = peerTimestamps.keys.toList()
 
     var hasAudioPermission by remember {
         mutableStateOf(
@@ -44,6 +56,77 @@ fun MainScreen(
         contract = ActivityResultContracts.RequestPermission()
     ) { isGranted ->
         hasAudioPermission = isGranted
+    }
+
+    // UDP Peer Discovery Engine (Broadcaster & Receiver)
+    LaunchedEffect(Unit) {
+        val discoveryPort = 50006
+        val beaconMessage = "RIDER_COMMS_BEACON".toByteArray()
+
+        // 1. Broadcaster Coroutine
+        launch(Dispatchers.IO) {
+            val wifiManager = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+            val multicastLock = wifiManager?.createMulticastLock("RiderCommsDiscovery")
+            multicastLock?.acquire()
+
+            try {
+                val socket = DatagramSocket()
+                socket.broadcast = true
+
+                while (isActive) {
+                    try {
+                        val broadcastAddr = InetAddress.getByName("255.255.255.255")
+                        val packet = DatagramPacket(beaconMessage, beaconMessage.size, broadcastAddr, discoveryPort)
+                        socket.send(packet)
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                    }
+                    delay(2000)
+                }
+                socket.close()
+            } finally {
+                if (multicastLock?.isHeld == true) {
+                    multicastLock.release()
+                }
+            }
+        }
+
+        // 2. Listener Coroutine
+        launch(Dispatchers.IO) {
+            try {
+                val socket = DatagramSocket(discoveryPort)
+                socket.broadcast = true
+                val buffer = ByteArray(1024)
+
+                while (isActive) {
+                    val packet = DatagramPacket(buffer, buffer.size)
+                    socket.receive(packet)
+                    val receivedStr = String(packet.data, 0, packet.length)
+
+                    if (receivedStr.startsWith("RIDER_COMMS_BEACON")) {
+                        val senderIp = packet.address.hostAddress
+                        if (senderIp != null && !isLocalIp(senderIp)) {
+                            val currentTime = System.currentTimeMillis()
+                            peerTimestamps = peerTimestamps.toMutableMap().apply {
+                                put(senderIp, currentTime)
+                            }
+                        }
+                    }
+                }
+                socket.close()
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+
+        // 3. Stale Peer Cleanup Coroutine
+        launch(Dispatchers.IO) {
+            while (isActive) {
+                delay(4000)
+                val now = System.currentTimeMillis()
+                peerTimestamps = peerTimestamps.filterValues { now - it < 6000 }
+            }
+        }
     }
 
     DisposableEffect(Unit) {
@@ -232,7 +315,7 @@ fun MainScreen(
                             contentAlignment = Alignment.Center
                         ) {
                             Text(
-                                text = "No peers discovered yet",
+                                text = "Scanning for peers on local network...",
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -242,8 +325,27 @@ fun MainScreen(
                             verticalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
                             items(discoveredPeers) { peerIp ->
+                                val isConnected = targetIp == peerIp && (isStreaming || isListening)
                                 Card(
-                                    onClick = { targetIp = peerIp },
+                                    onClick = {
+                                        targetIp = peerIp
+                                        val port = targetPort.toIntOrNull() ?: 50005
+
+                                        audioStreamManager.stopRecording()
+                                        audioStreamManager.stopPlaying()
+
+                                        if (hasAudioPermission && !isMuted) {
+                                            audioStreamManager.startRecording(peerIp, port)
+                                            isStreaming = true
+                                        }
+                                        audioStreamManager.startPlaying(port)
+                                        isListening = true
+                                    },
+                                    colors = if (isConnected) {
+                                        CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
+                                    } else {
+                                        CardDefaults.cardColors()
+                                    },
                                     modifier = Modifier.fillMaxWidth()
                                 ) {
                                     Row(
@@ -253,11 +355,35 @@ fun MainScreen(
                                         horizontalArrangement = Arrangement.SpaceBetween,
                                         verticalAlignment = Alignment.CenterVertically
                                     ) {
-                                        Text(text = peerIp)
-                                        Text(
-                                            text = "Tap to select",
-                                            style = MaterialTheme.typography.labelSmall
-                                        )
+                                        Column {
+                                            Text(
+                                                text = peerIp,
+                                                style = MaterialTheme.typography.bodyLarge
+                                            )
+                                            Text(
+                                                text = if (isConnected) "Connected & Streaming" else "Available",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = if (isConnected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                        }
+                                        Button(
+                                            onClick = {
+                                                targetIp = peerIp
+                                                val port = targetPort.toIntOrNull() ?: 50005
+
+                                                audioStreamManager.stopRecording()
+                                                audioStreamManager.stopPlaying()
+
+                                                if (hasAudioPermission && !isMuted) {
+                                                    audioStreamManager.startRecording(peerIp, port)
+                                                    isStreaming = true
+                                                }
+                                                audioStreamManager.startPlaying(port)
+                                                isListening = true
+                                            }
+                                        ) {
+                                            Text(if (isConnected) "Active" else "Connect")
+                                        }
                                     }
                                 }
                             }
@@ -267,4 +393,23 @@ fun MainScreen(
             }
         }
     }
+}
+
+private fun isLocalIp(ip: String): Boolean {
+    try {
+        val interfaces = NetworkInterface.getNetworkInterfaces()
+        while (interfaces.hasMoreElements()) {
+            val networkInterface = interfaces.nextElement()
+            val addresses = networkInterface.inetAddresses
+            while (addresses.hasMoreElements()) {
+                val addr = addresses.nextElement()
+                if (!addr.isLoopbackAddress && addr.hostAddress == ip) {
+                    return true
+                }
+            }
+        }
+    } catch (e: Exception) {
+        e.printStackTrace()
+    }
+    return false
 }
