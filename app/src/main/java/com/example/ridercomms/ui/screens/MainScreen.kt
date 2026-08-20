@@ -33,9 +33,9 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Bluetooth
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MicOff
-import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.SportsMotorsports
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -468,38 +468,42 @@ fun MainScreen(
 
         hostServerJob = coroutineScope.launch(Dispatchers.IO) {
             var serverSocket: BluetoothServerSocket? = null
-            try {
-                serverSocket = bluetoothAdapter?.listenUsingInsecureRfcommWithServiceRecord("RiderCommsHost", RIDER_COMMS_UUID)
-                val socket = serverSocket?.accept()
-                if (socket != null) {
-                    playNotificationTone()
-
-                    val inputStream = socket.inputStream
-                    val nameBuffer = ByteArray(256)
-                    val bytesRead = try {
-                        inputStream.read(nameBuffer)
-                    } catch (e: Exception) {
-                        -1
-                    }
-
-                    val clientRiderName = if (bytesRead > 0) {
-                        String(nameBuffer, 0, bytesRead, StandardCharsets.UTF_8).trim()
-                    } else {
-                        "Nearby Rider"
-                    }
-
-                    withContext(Dispatchers.Main) {
-                        activeSocket = socket
-                        pendingConnectionDevice = Pair(clientRiderName, socket.remoteDevice)
-                    }
-                }
-            } catch (e: Exception) {
-                e.printStackTrace()
-            } finally {
+            while (isActive && !isConnected) {
                 try {
-                    serverSocket?.close()
+                    serverSocket = bluetoothAdapter?.listenUsingInsecureRfcommWithServiceRecord("RiderCommsHost", RIDER_COMMS_UUID)
+                    val socket = serverSocket?.accept()
+                    if (socket != null) {
+                        playNotificationTone()
+
+                        val inputStream = socket.inputStream
+                        val nameBuffer = ByteArray(256)
+                        val bytesRead = try {
+                            inputStream.read(nameBuffer)
+                        } catch (e: Exception) {
+                            -1
+                        }
+
+                        val clientRiderName = if (bytesRead > 0) {
+                            String(nameBuffer, 0, bytesRead, StandardCharsets.UTF_8).trim()
+                        } else {
+                            "Nearby Rider"
+                        }
+
+                        withContext(Dispatchers.Main) {
+                            activeSocket = socket
+                            pendingConnectionDevice = Pair(clientRiderName, socket.remoteDevice)
+                        }
+                        break
+                    }
                 } catch (e: Exception) {
                     e.printStackTrace()
+                    delay(1000)
+                } finally {
+                    try {
+                        serverSocket?.close()
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                    }
                 }
             }
         }
@@ -511,19 +515,40 @@ fun MainScreen(
         coroutineScope.launch(Dispatchers.IO) {
             try {
                 stopBleScanning()
+                bluetoothAdapter?.cancelDiscovery()
+
                 val targetDevice = bluetoothAdapter?.getRemoteDevice(rider.device.address) ?: rider.device
-                val socket = targetDevice.createInsecureRfcommSocketToServiceRecord(RIDER_COMMS_UUID)
-                socket.connect()
+                var socket: BluetoothSocket? = null
 
-                val nameBytes = riderName.toByteArray(StandardCharsets.UTF_8)
-                socket.outputStream.write(nameBytes)
-                socket.outputStream.flush()
+                // Connection attempt with fallback logic for unpaired devices
+                try {
+                    socket = targetDevice.createInsecureRfcommSocketToServiceRecord(RIDER_COMMS_UUID)
+                    socket.connect()
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                    try {
+                        val m = targetDevice.javaClass.getMethod("createInsecureRfcommSocket", Int::class.javaPrimitiveType)
+                        socket = m.invoke(targetDevice, 1) as BluetoothSocket
+                        socket.connect()
+                    } catch (e2: Exception) {
+                        e2.printStackTrace()
+                        val m = targetDevice.javaClass.getMethod("createRfcommSocket", Int::class.javaPrimitiveType)
+                        socket = m.invoke(targetDevice, 1) as BluetoothSocket
+                        socket.connect()
+                    }
+                }
 
-                withContext(Dispatchers.Main) {
-                    activeSocket = socket
-                    connectedDeviceName = rider.customName
-                    isConnected = true
-                    startAudioStreams(socket)
+                if (socket != null && socket.isConnected) {
+                    val nameBytes = riderName.toByteArray(StandardCharsets.UTF_8)
+                    socket.outputStream.write(nameBytes)
+                    socket.outputStream.flush()
+
+                    withContext(Dispatchers.Main) {
+                        activeSocket = socket
+                        connectedDeviceName = rider.customName
+                        isConnected = true
+                        startAudioStreams(socket)
+                    }
                 }
             } catch (e: Exception) {
                 e.printStackTrace()
