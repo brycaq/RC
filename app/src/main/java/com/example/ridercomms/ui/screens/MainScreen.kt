@@ -191,7 +191,7 @@ fun MainScreen(
         hostServerJob = coroutineScope.launch(Dispatchers.IO) {
             var serverSocket: BluetoothServerSocket? = null
             try {
-                serverSocket = bluetoothAdapter?.listenInsecureRfcommWithServiceRecord("RiderCommsHost", RIDER_COMMS_UUID)
+                serverSocket = bluetoothAdapter?.listenUsingInsecureRfcommWithServiceRecord("RiderCommsHost", RIDER_COMMS_UUID)
                 val socket = serverSocket?.accept()
                 if (socket != null) {
                     pendingConnectionDevice = socket.remoteDevice
