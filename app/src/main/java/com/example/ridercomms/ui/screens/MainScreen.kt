@@ -132,19 +132,28 @@ fun MainScreen(
         hasPermissions = permissions.values.all { it }
     }
 
-    // Classic Bluetooth Receiver to fetch BR/EDR addresses for RFCOMM
+    // Classic Bluetooth Receiver filtered strictly for RiderComms devices
     DisposableEffect(context) {
         val receiver = object : BroadcastReceiver() {
             @SuppressLint("MissingPermission")
             override fun onReceive(context: Context?, intent: Intent?) {
                 when (intent?.action) {
                     BluetoothDevice.ACTION_FOUND -> {
-                        val device: BluetoothDevice? = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
+                        val device: BluetoothDevice? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                            intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
+                        } else {
+                            @Suppress("DEPRECATION")
+                            intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
+                        }
+
                         device?.let { dev ->
-                            val devName = dev.name ?: "Rider (${dev.address.takeLast(5)})"
-                            val existingIndex = discoveredRiders.indexOfFirst { it.device.address == dev.address }
-                            if (existingIndex < 0) {
-                                discoveredRiders = discoveredRiders + DiscoveredRider(customName = devName, device = dev)
+                            val devName = dev.name
+                            // Only include devices that explicitly contain "Rider" in their broadcast name
+                            if (!devName.isNullOrBlank() && devName.contains("Rider", ignoreCase = true)) {
+                                val existingIndex = discoveredRiders.indexOfFirst { it.device.address == dev.address }
+                                if (existingIndex < 0) {
+                                    discoveredRiders = discoveredRiders + DiscoveredRider(customName = devName, device = dev)
+                                }
                             }
                         }
                     }
@@ -194,9 +203,11 @@ fun MainScreen(
         stopClassicDiscovery()
         discoveredRiders = emptyList()
 
-        // Include paired devices directly
+        // Include paired devices that match the Rider naming scheme
         val paired = bluetoothAdapter.bondedDevices ?: emptySet()
-        val pairedRiders = paired.map { DiscoveredRider(it.name ?: "Paired Rider", it) }
+        val pairedRiders = paired
+            .filter { !it.name.isNullOrBlank() && it.name.contains("Rider", ignoreCase = true) }
+            .map { DiscoveredRider(it.name ?: "Rider Device", it) }
         discoveredRiders = pairedRiders
 
         bluetoothAdapter.startDiscovery()
@@ -773,7 +784,7 @@ fun MainScreen(
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Text(
-                                text = if (isScanning) "Searching Classic Bluetooth Devices..." else "Available Bluetooth Devices",
+                                text = if (isScanning) "Searching RiderComms Devices..." else "Available RiderComms Devices",
                                 style = MaterialTheme.typography.titleMedium
                             )
                             IconButton(onClick = { startClassicDiscovery() }) {
@@ -786,7 +797,7 @@ fun MainScreen(
                                 modifier = Modifier.fillMaxSize(),
                                 contentAlignment = Alignment.Center
                             ) {
-                                Text(if (isScanning) "Scanning for nearby devices..." else "No devices found.")
+                                Text(if (isScanning) "Scanning for nearby riders..." else "No RiderComms devices found.")
                             }
                         } else {
                             LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
