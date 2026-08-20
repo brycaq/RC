@@ -91,7 +91,8 @@ fun MainScreen(
     var isMuted by remember { mutableStateOf(false) }
     var isConnected by remember { mutableStateOf(false) }
     var connectedDeviceName by remember { mutableStateOf<String?>(null) }
-    var pendingConnectionDevice by remember { mutableStateOf<Pair<String, BluetoothDevice>?>(null) }
+    var pendingConnectionDevice by remember { mutableStateOf<Pair<String, BluetoothSocket>?>(null) }
+    var connectionStatusMsg by remember { mutableStateOf<String?>(null) }
 
     var discoveredRiders by remember { mutableStateOf(listOf<DiscoveredRider>()) }
     var isScanning by remember { mutableStateOf(false) }
@@ -458,6 +459,7 @@ fun MainScreen(
         activeSocket = null
         isConnected = false
         connectedDeviceName = null
+        connectionStatusMsg = null
     }
 
     @SuppressLint("MissingPermission")
@@ -490,8 +492,7 @@ fun MainScreen(
                         }
 
                         withContext(Dispatchers.Main) {
-                            activeSocket = socket
-                            pendingConnectionDevice = Pair(clientRiderName, socket.remoteDevice)
+                            pendingConnectionDevice = Pair(clientRiderName, socket)
                         }
                         break
                     }
@@ -513,6 +514,9 @@ fun MainScreen(
     fun connectToRider(rider: DiscoveredRider) {
         if (!hasPermissions) return
         coroutineScope.launch(Dispatchers.IO) {
+            withContext(Dispatchers.Main) {
+                connectionStatusMsg = "Handshaking with ${rider.customName}... Waiting for Host approval."
+            }
             try {
                 stopBleScanning()
                 bluetoothAdapter?.cancelDiscovery()
@@ -520,7 +524,7 @@ fun MainScreen(
                 val targetDevice = bluetoothAdapter?.getRemoteDevice(rider.device.address) ?: rider.device
                 var socket: BluetoothSocket? = null
 
-                // Connection attempt with fallback logic for unpaired devices
+                // Connection attempt with reflection fallback for unpaired devices
                 try {
                     socket = targetDevice.createInsecureRfcommSocketToServiceRecord(RIDER_COMMS_UUID)
                     socket.connect()
@@ -539,19 +543,37 @@ fun MainScreen(
                 }
 
                 if (socket != null && socket.isConnected) {
+                    // Step 1: Send client rider name handshake request
                     val nameBytes = riderName.toByteArray(StandardCharsets.UTF_8)
                     socket.outputStream.write(nameBytes)
                     socket.outputStream.flush()
 
+                    // Step 2: Wait for Host Permission Confirmation byte (1 = Allowed, 0 = Declined)
+                    val responseByte = socket.inputStream.read()
+                    if (responseByte == 1) {
+                        withContext(Dispatchers.Main) {
+                            activeSocket = socket
+                            connectedDeviceName = rider.customName
+                            isConnected = true
+                            connectionStatusMsg = null
+                            startAudioStreams(socket)
+                        }
+                    } else {
+                        socket.close()
+                        withContext(Dispatchers.Main) {
+                            connectionStatusMsg = "Host declined the connection request."
+                        }
+                    }
+                } else {
                     withContext(Dispatchers.Main) {
-                        activeSocket = socket
-                        connectedDeviceName = rider.customName
-                        isConnected = true
-                        startAudioStreams(socket)
+                        connectionStatusMsg = "Unable to establish socket connection with Host."
                     }
                 }
             } catch (e: Exception) {
                 e.printStackTrace()
+                withContext(Dispatchers.Main) {
+                    connectionStatusMsg = "Connection failed: ${e.localizedMessage ?: "Timeout"}"
+                }
             }
         }
     }
@@ -569,36 +591,62 @@ fun MainScreen(
         }
     }
 
+    // Host Permission Ask Dialog
     if (pendingConnectionDevice != null) {
+        val (clientName, socket) = pendingConnectionDevice!!
         AlertDialog(
             onDismissRequest = {
-                disconnectSession()
+                coroutineScope.launch(Dispatchers.IO) {
+                    try {
+                        socket.outputStream.write(0) // Decline ACK
+                        socket.outputStream.flush()
+                        socket.close()
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                    }
+                }
                 pendingConnectionDevice = null
                 startHosting()
             },
             title = { Text("Rider Connection Request") },
             text = {
-                Text("${pendingConnectionDevice?.first ?: "A nearby Rider"} wants to connect to your audio stream.")
+                Text("$clientName is asking for permission to join your intercom session. Allow connection?")
             },
             confirmButton = {
                 Button(
                     onClick = {
-                        val socket = activeSocket
-                        if (socket != null) {
-                            connectedDeviceName = pendingConnectionDevice?.first ?: "Connected Rider"
-                            isConnected = true
-                            startAudioStreams(socket)
+                        coroutineScope.launch(Dispatchers.IO) {
+                            try {
+                                socket.outputStream.write(1) // Allowed ACK
+                                socket.outputStream.flush()
+                                withContext(Dispatchers.Main) {
+                                    activeSocket = socket
+                                    connectedDeviceName = clientName
+                                    isConnected = true
+                                    startAudioStreams(socket)
+                                }
+                            } catch (e: Exception) {
+                                e.printStackTrace()
+                            }
                         }
                         pendingConnectionDevice = null
                     }
                 ) {
-                    Text("Accept Connection")
+                    Text("Allow Connection")
                 }
             },
             dismissButton = {
                 OutlinedButton(
                     onClick = {
-                        disconnectSession()
+                        coroutineScope.launch(Dispatchers.IO) {
+                            try {
+                                socket.outputStream.write(0) // Decline ACK
+                                socket.outputStream.flush()
+                                socket.close()
+                            } catch (e: Exception) {
+                                e.printStackTrace()
+                            }
+                        }
                         pendingConnectionDevice = null
                         startHosting()
                     }
@@ -693,7 +741,7 @@ fun MainScreen(
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
                     Text(
-                        text = if (isConnected) "Connected with $connectedDeviceName" else if (selectedRole == UserRole.HOST) "Broadcasting app ID as '$riderName'..." else "Select a rider using RiderComms",
+                        text = if (isConnected) "Connected with $connectedDeviceName" else if (selectedRole == UserRole.HOST) "Broadcasting app ID as '$riderName'..." else connectionStatusMsg ?: "Select a rider using RiderComms",
                         style = MaterialTheme.typography.titleMedium
                     )
 
