@@ -1,134 +1,160 @@
 package com.example.ridercomms.network
 
 import android.annotation.SuppressLint
+import android.media.AudioAttributes
 import android.media.AudioFormat
-import android.media.AudioManager
 import android.media.AudioRecord
-import android.media.AudioSource
 import android.media.AudioTrack
+import android.media.MediaRecorder
+import android.media.MediaRecorder.AudioSource
+import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
 
-class AudioStreamManager(
-    private val port: Int = 50005,
-    private val onPeerDiscovered: (String) -> Unit
-) {
-    private val sampleRate = 16000
-    private val channelIn = AudioFormat.CHANNEL_IN_MONO
-    private val channelOut = AudioFormat.CHANNEL_OUT_MONO
-    private val audioFormat = AudioFormat.ENCODING_PCM_16BIT
-    private val bufferSize = AudioRecord.getMinBufferSize(sampleRate, channelIn, audioFormat)
+class AudioStreamManager {
 
-    private var socket: DatagramSocket? = null
-    private var isRunning = false
-    private var isMuted = true
-    private var targetIpAddress: String? = null
+    private val sampleRate = 16000
+    private val channelConfigRecord = AudioFormat.CHANNEL_IN_MONO
+    private val channelConfigPlay = AudioFormat.CHANNEL_OUT_MONO
+    private val audioEncoding = AudioFormat.ENCODING_PCM_16BIT
+
+    private var audioRecord: AudioRecord? = null
+    private var audioTrack: AudioTrack? = null
+
+    private var isRecording = false
+    private var isPlaying = false
 
     private var recordJob: Job? = null
-    private var receiveJob: Job? = null
+    private var playJob: Job? = null
+
     private val scope = CoroutineScope(Dispatchers.IO)
 
     @SuppressLint("MissingPermission")
-    fun start(targetIp: String? = null) {
-        if (isRunning) stop()
-        this.targetIpAddress = targetIp
-        isRunning = true
+    fun startRecording(targetIp: String, targetPort: Int) {
+        if (isRecording) return
 
-        try {
-            socket = DatagramSocket(port)
-            socket?.reuseAddress = true
-        } catch (e: Exception) {
-            e.printStackTrace()
+        val minBufferSize = AudioRecord.getMinBufferSize(
+            sampleRate,
+            channelConfigRecord,
+            audioEncoding
+        )
+
+        if (minBufferSize == AudioRecord.ERROR_BAD_VALUE || minBufferSize == AudioRecord.ERROR) {
+            Log.e("AudioStreamManager", "Invalid AudioRecord buffer size")
+            return
         }
 
-        // Receiver Loop: Plays incoming UDP audio packets through speaker
-        receiveJob = scope.launch {
-            val track = AudioTrack(
-                AudioManager.STREAM_MUSIC,
-                sampleRate,
-                channelOut,
-                audioFormat,
-                bufferSize,
-                AudioTrack.MODE_STREAM
-            )
-            track.play()
+        audioRecord = AudioRecord(
+            AudioSource.VOICE_COMMUNICATION,
+            sampleRate,
+            channelConfigRecord,
+            audioEncoding,
+            minBufferSize
+        )
 
-            val receiveBuffer = ByteArray(bufferSize)
-            while (isRunning) {
-                try {
-                    val packet = DatagramPacket(receiveBuffer, receiveBuffer.size)
-                    socket?.receive(packet)
-
-                    val senderIp = packet.address?.hostAddress
-                    if (senderIp != null) {
-                        onPeerDiscovered(senderIp)
-                        // If host, automatically target the client IP back
-                        if (targetIpAddress == null) {
-                            targetIpAddress = senderIp
-                        }
-                    }
-
-                    track.write(packet.data, 0, packet.length)
-                } catch (e: Exception) {
-                    break
-                }
-            }
-            track.stop()
-            track.release()
+        if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
+            Log.e("AudioStreamManager", "AudioRecord failed to initialize")
+            return
         }
 
-        // Sender Loop: Captures mic audio and broadcasts over UDP
+        isRecording = true
+        audioRecord?.startRecording()
+
         recordJob = scope.launch {
-            val recorder = AudioRecord(
-                AudioSource.MIC,
-                sampleRate,
-                channelIn,
-                audioFormat,
-                bufferSize
-            )
+            try {
+                val socket = DatagramSocket()
+                val address = InetAddress.getByName(targetIp)
+                val buffer = ByteArray(minBufferSize)
 
-            if (recorder.state == AudioRecord.STATE_INITIALIZED) {
-                recorder.startRecording()
-                val sendBuffer = ByteArray(bufferSize)
-
-                while (isRunning) {
-                    val readBytes = recorder.read(sendBuffer, 0, sendBuffer.size)
-                    if (readBytes > 0 && !isMuted && !targetIpAddress.isNull_or_Empty()) {
-                        try {
-                            val address = InetAddress.getByName(targetIpAddress)
-                            val packet = DatagramPacket(sendBuffer, readBytes, address, port)
-                            socket?.send(packet)
-                        } catch (e: Exception) {
-                            e.printStackTrace()
-                        }
+                while (isActive && isRecording) {
+                    val readBytes = audioRecord?.read(buffer, 0, buffer.size) ?: 0
+                    if (readBytes > 0) {
+                        val packet = DatagramPacket(buffer, readBytes, address, targetPort)
+                        socket.send(packet)
                     }
                 }
-                recorder.stop()
-                recorder.release()
+                socket.close()
+            } catch (e: Exception) {
+                Log.e("AudioStreamManager", "Error recording/sending audio", e)
             }
         }
     }
 
-    fun setMuted(muted: Boolean) {
-        isMuted = muted
-    }
-
-    fun setTargetIp(ip: String) {
-        this.targetIpAddress = ip
-    }
-
-    fun stop() {
-        isRunning = false
+    fun stopRecording() {
+        isRecording = false
         recordJob?.cancel()
-        receiveJob?.cancel()
-        socket?.close()
-        socket = null
+        try {
+            audioRecord?.stop()
+            audioRecord?.release()
+        } catch (e: Exception) {
+            Log.e("AudioStreamManager", "Error stopping AudioRecord", e)
+        } finally {
+            audioRecord = null
+        }
     }
 
-    private fun String?.isNull_or_Empty(): Boolean = this == null || this.isEmpty()
+    fun startPlaying(listenPort: Int) {
+        if (isPlaying) return
+
+        val minBufferSize = AudioTrack.getMinBufferSize(
+            sampleRate,
+            channelConfigPlay,
+            audioEncoding
+        )
+
+        audioTrack = AudioTrack.Builder()
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build()
+            )
+            .setAudioFormat(
+                AudioFormat.Builder()
+                    .setEncoding(audioEncoding)
+                    .setSampleRate(sampleRate)
+                    .setChannelMask(channelConfigPlay)
+                    .build()
+            )
+            .setBufferSizeInBytes(minBufferSize)
+            .build()
+
+        isPlaying = true
+        audioTrack?.play()
+
+        playJob = scope.launch {
+            try {
+                val socket = DatagramSocket(listenPort)
+                val buffer = ByteArray(minBufferSize)
+
+                while (isActive && isPlaying) {
+                    val packet = DatagramPacket(buffer, buffer.size)
+                    socket.receive(packet)
+                    audioTrack?.write(packet.data, 0, packet.length)
+                }
+                socket.close()
+            } catch (e: Exception) {
+                Log.e("AudioStreamManager", "Error playing audio", e)
+            }
+        }
+    }
+
+    fun stopPlaying() {
+        isPlaying = false
+        playJob?.cancel()
+        try {
+            audioTrack?.stop()
+            audioTrack?.release()
+        } catch (e: Exception) {
+            Log.e("AudioStreamManager", "Error stopping AudioTrack", e)
+        } finally {
+            audioTrack = null
+        }
+    }
 }
