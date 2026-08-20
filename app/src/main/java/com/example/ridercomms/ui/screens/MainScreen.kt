@@ -183,7 +183,7 @@ fun MainScreen(
                 bluetoothAdapter.cancelDiscovery()
             }
         } catch (e: Exception) {
-            e.printStackTrace Jackson
+            e.printStackTrace()
         }
         isScanning = false
     }
@@ -194,7 +194,7 @@ fun MainScreen(
         stopClassicDiscovery()
         discoveredRiders = emptyList()
 
-        // Include paired paired devices directly
+        // Include paired devices directly
         val paired = bluetoothAdapter.bondedDevices ?: emptySet()
         val pairedRiders = paired.map { DiscoveredRider(it.name ?: "Paired Rider", it) }
         discoveredRiders = pairedRiders
